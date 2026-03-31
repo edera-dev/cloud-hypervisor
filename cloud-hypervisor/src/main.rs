@@ -203,7 +203,9 @@ fn get_cli_options_sorted(
         Arg::new("console")
             .long("console")
             .help("Control (virtio) console: \"off|null|pty|tty|file=</path/to/a/file>,iommu=on|off\"")
-            .default_value("tty")
+            .num_args(1..)
+            .action(ArgAction::Append)
+            .default_values(["tty"])
             .group("vm-config"),
         Arg::new("cpus")
             .long("cpus")
@@ -1052,12 +1054,12 @@ mod unit_tests {
                 iommu: false,
                 socket: None,
             },
-            console: ConsoleConfig {
+            consoles: vec![ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
                 socket: None,
-            },
+            }],
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,
@@ -1712,7 +1714,7 @@ mod unit_tests {
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Null"},
-                    "console": {"mode": "Tty"}
+                    "consoles": [{"mode": "Tty"}]
                 }"#,
                 true,
             ),
@@ -1744,7 +1746,7 @@ mod unit_tests {
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Tty"},
-                    "console": {"mode": "Off"}
+                    "consoles": [{"mode": "Off"}]
                 }"#,
                 true,
             ),
@@ -1763,7 +1765,7 @@ mod unit_tests {
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Null"},
-                    "console": {"mode": "Tty"}
+                    "consoles": [{"mode": "Tty"}]
                 }"#,
                 true,
             ),
@@ -1790,12 +1792,30 @@ mod unit_tests {
                     "--serial",
                     "pty",
                     "--console",
+                    "tty",
+                    "file=/path/to/console",
+                ],
+                r#"{
+                    "payload": {"kernel": "/path/to/kernel"},
+                    "serial": {"mode": "Pty"},
+                    "consoles": [{"mode": "Tty"}, {"mode": "File", "file": "/path/to/console"}]
+                }"#,
+                true,
+            ),
+            (
+                vec![
+                    "cloud-hypervisor",
+                    "--kernel",
+                    "/path/to/kernel",
+                    "--serial",
+                    "pty",
+                    "--console",
                     "pty",
                 ],
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Pty"},
-                    "console": {"mode": "Pty"}
+                    "consoles": [{"mode": "Pty"}]
                 }"#,
                 true,
             ),

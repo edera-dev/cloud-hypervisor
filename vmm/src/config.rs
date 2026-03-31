@@ -450,7 +450,7 @@ pub struct VmParams<'a> {
     pub generic_vhost_user: Option<Vec<&'a str>>,
     pub pmem: Option<Vec<&'a str>>,
     pub serial: &'a str,
-    pub console: &'a str,
+    pub consoles: Vec<&'a str>,
     #[cfg(target_arch = "x86_64")]
     pub debug_console: &'a str,
     pub devices: Option<Vec<&'a str>>,
@@ -502,7 +502,11 @@ impl<'a> VmParams<'a> {
         let net: Option<Vec<&str>> = args
             .get_many::<String>("net")
             .map(|x| x.map(|y| y as &str).collect());
-        let console = args.get_one::<String>("console").unwrap();
+        let consoles: Vec<&str> = args
+            .get_many::<String>("console")
+            .unwrap()
+            .map(|y| y as &str)
+            .collect();
         #[cfg(target_arch = "x86_64")]
         let debug_console = args.get_one::<String>("debug-console").unwrap().as_str();
         let balloon = args.get_one::<String>("balloon").map(|x| x as &str);
@@ -569,7 +573,7 @@ impl<'a> VmParams<'a> {
             generic_vhost_user,
             pmem,
             serial,
-            console,
+            consoles,
             #[cfg(target_arch = "x86_64")]
             debug_console,
             devices,
@@ -2853,8 +2857,10 @@ impl VmConfig {
         // "console=hvc0 earlyprintk=ttyS0"
 
         let mut tty_consoles = Vec::new();
-        if self.console.mode == ConsoleOutputMode::Tty {
-            tty_consoles.push("virtio-console");
+        for console in self.consoles.iter() {
+            if console.mode == ConsoleOutputMode::Tty {
+                tty_consoles.push("virtio-console");
+            }
         }
         if self.serial.mode == ConsoleOutputMode::Tty {
             tty_consoles.push("serial-console");
@@ -2867,8 +2873,10 @@ impl VmConfig {
             warn!("Using TTY output for multiple consoles: {tty_consoles:?}");
         }
 
-        if self.console.mode == ConsoleOutputMode::File && self.console.file.is_none() {
-            return Err(ValidationError::ConsoleFileMissing);
+        for console in self.consoles.iter() {
+            if console.mode == ConsoleOutputMode::File && console.file.is_none() {
+                return Err(ValidationError::ConsoleFileMissing);
+            }
         }
 
         if self.serial.mode == ConsoleOutputMode::File && self.serial.file.is_none() {
@@ -2974,7 +2982,9 @@ impl VmConfig {
         }
 
         self.iommu |= self.rng.iommu;
-        self.iommu |= self.console.iommu;
+        for console in self.consoles.iter() {
+            self.iommu |= console.iommu;
+        }
 
         if let Some(t) = &self.cpus.topology {
             if t.threads_per_core == 0
@@ -3241,7 +3251,11 @@ impl VmConfig {
             pmem = Some(pmem_config_list);
         }
 
-        let console = ConsoleConfig::parse(vm_params.console)?;
+        let mut consoles: Vec<ConsoleConfig> = Vec::new();
+        for console in vm_params.consoles.iter() {
+            let console_config = ConsoleConfig::parse(console)?;
+            consoles.push(console_config);
+        }
         let serial = ConsoleConfig::parse(vm_params.serial)?;
         #[cfg(target_arch = "x86_64")]
         let debug_console = DebugConsoleConfig::parse(vm_params.debug_console)?;
@@ -3370,7 +3384,7 @@ impl VmConfig {
             fs,
             pmem,
             serial,
-            console,
+            consoles,
             #[cfg(target_arch = "x86_64")]
             debug_console,
             devices,
@@ -3512,7 +3526,7 @@ impl Clone for VmConfig {
             generic_vhost_user: self.generic_vhost_user.clone(),
             pmem: self.pmem.clone(),
             serial: self.serial.clone(),
-            console: self.console.clone(),
+            consoles: self.consoles.clone(),
             #[cfg(target_arch = "x86_64")]
             debug_console: self.debug_console.clone(),
             devices: self.devices.clone(),
@@ -4709,7 +4723,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             fs: None,
             pmem: None,
             serial: default_serial(),
-            console: default_console(),
+            consoles: default_console(),
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,
@@ -4948,12 +4962,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 iommu: false,
                 socket: None,
             },
-            console: ConsoleConfig {
+            consoles: vec![ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
                 socket: None,
-            },
+            }],
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,
@@ -4982,7 +4996,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.serial.mode = ConsoleOutputMode::Tty;
-        invalid_config.console.mode = ConsoleOutputMode::Tty;
+        invalid_config.consoles[0].mode = ConsoleOutputMode::Tty;
         valid_config.validate().unwrap();
 
         let mut invalid_config = valid_config.clone();

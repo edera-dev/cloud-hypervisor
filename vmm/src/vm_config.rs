@@ -934,13 +934,13 @@ pub fn default_serial() -> ConsoleConfig {
     }
 }
 
-pub fn default_console() -> ConsoleConfig {
-    ConsoleConfig {
+pub fn default_console() -> Vec<ConsoleConfig> {
+    vec![ConsoleConfig {
         file: None,
         mode: ConsoleOutputMode::Tty,
         iommu: false,
         socket: None,
-    }
+    }]
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -987,7 +987,7 @@ pub struct VmConfig {
     #[serde(default = "default_serial")]
     pub serial: ConsoleConfig,
     #[serde(default = "default_console")]
-    pub console: ConsoleConfig,
+    pub consoles: Vec<ConsoleConfig>,
     #[cfg(target_arch = "x86_64")]
     #[serde(default)]
     pub debug_console: DebugConsoleConfig,
@@ -1070,7 +1070,9 @@ impl VmConfig {
             }
         }
 
-        self.console.apply_landlock(&mut landlock)?;
+        for console in self.consoles.iter() {
+            console.apply_landlock(&mut landlock)?;
+        }
         self.serial.apply_landlock(&mut landlock)?;
 
         #[cfg(target_arch = "x86_64")]

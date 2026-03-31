@@ -2706,13 +2706,13 @@ mod unit_tests {
                 iommu: false,
                 socket: None,
             },
-            console: ConsoleConfig {
+            consoles: vec![ConsoleConfig {
                 file: None,
                 // Caution: Don't use `Tty` to not mess with users terminal
                 mode: ConsoleOutputMode::Off,
                 iommu: false,
                 socket: None,
-            },
+            }],
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,

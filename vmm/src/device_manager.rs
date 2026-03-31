@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Seek, SeekFrom, stdout};
+use std::iter::zip;
 use std::num::Wrapping;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -121,9 +122,10 @@ use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
-    ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig,
-    PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
+    ConsoleConfig, ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS,
+    DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT, DeviceConfig, DiskConfig, FsConfig,
+    GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig, PmemConfig, UserDeviceConfig,
+    VdpaConfig, VhostMode, VmConfig, VsockConfig,
 };
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
 
@@ -143,7 +145,6 @@ const IOMMU_DEVICE_NAME: &str = "__iommu";
 #[cfg(feature = "pvmemcontrol")]
 const PVMEMCONTROL_DEVICE_NAME: &str = "__pvmemcontrol";
 const BALLOON_DEVICE_NAME: &str = "__balloon";
-const CONSOLE_DEVICE_NAME: &str = "__console";
 const PVPANIC_DEVICE_NAME: &str = "__pvpanic";
 #[cfg(feature = "ivshmem")]
 const IVSHMEM_DEVICE_NAME: &str = "__ivshmem";
@@ -161,6 +162,7 @@ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
 const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
+const CONSOLE_DEVICE_NAME_PREFIX: &str = "__console";
 
 /// Errors associated with device manager
 #[derive(Error, Debug)]
@@ -2365,10 +2367,10 @@ impl DeviceManager {
 
     fn add_virtio_console_device(
         &mut self,
+        console_config: ConsoleConfig,
         transport: ConsoleTransport,
         resize_pipe: Option<Arc<File>>,
     ) -> DeviceManagerResult<Option<Arc<virtio_devices::ConsoleResizer>>> {
-        let console_config = self.config.lock().unwrap().console.clone();
         let endpoint = match transport {
             ConsoleTransport::File(file) => Endpoint::File(file),
             ConsoleTransport::Pty(file) => {
@@ -2402,7 +2404,7 @@ impl DeviceManager {
             ConsoleTransport::Null => Endpoint::Null,
             ConsoleTransport::Off => return Ok(None),
         };
-        let id = String::from(CONSOLE_DEVICE_NAME);
+        let id = self.next_device_name(CONSOLE_DEVICE_NAME_PREFIX)?;
 
         let (virtio_console_device, console_resizer) = virtio_devices::Console::new(
             id.clone(),
@@ -2516,8 +2518,21 @@ impl DeviceManager {
             }
         }
 
-        let console_resizer =
-            self.add_virtio_console_device(console_info.console, console_resize_pipe)?;
+        let mut console_resizer: Option<Arc<virtio_devices::ConsoleResizer>> = None;
+        let console_configs = self.config.lock().unwrap().consoles.clone();
+
+        for (console_config, console_transport) in zip(console_configs, console_info.consoles) {
+            match self.add_virtio_console_device(
+                console_config,
+                console_transport,
+                console_resize_pipe.clone(),
+            )? {
+                Some(console_resizer_) => {
+                    console_resizer.get_or_insert(console_resizer_);
+                }
+                None => {}
+            }
+        }
 
         Ok(Arc::new(Console { console_resizer }))
     }

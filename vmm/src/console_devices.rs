@@ -67,7 +67,7 @@ pub enum ConsoleTransport {
 
 #[derive(Clone)]
 pub struct ConsoleInfo {
-    pub console: ConsoleTransport,
+    pub consoles: Vec<ConsoleTransport>,
     pub serial: ConsoleTransport,
     #[cfg(target_arch = "x86_64")]
     pub debug: ConsoleTransport,
@@ -180,10 +180,12 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
     let mut vmconfig = vm_config.lock().unwrap();
     let mut original_termios_opt = vmm.original_termios_opt.lock().unwrap();
 
-    let console_info = ConsoleInfo {
-        console: match vmconfig.console.mode {
+    let mut consoles: Vec<ConsoleTransport> = Vec::new();
+
+    for console in vmconfig.consoles.iter_mut() {
+        let console_transport = match console.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.console.file.as_ref().unwrap())
+                let file = File::create(console.file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -191,7 +193,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 set_raw_mode(&sub_fd.as_raw_fd(), &mut original_termios_opt)?;
-                vmconfig.console.file = Some(path.clone());
+                console.file = Some(path.clone());
                 vmm.console_resize_pipe = Some(Arc::new(
                     listen_for_sigwinch_on_tty(
                         sub_fd,
@@ -229,7 +231,12 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
             }
             ConsoleOutputMode::Null => ConsoleTransport::Null,
             ConsoleOutputMode::Off => ConsoleTransport::Off,
-        },
+        };
+        consoles.push(console_transport);
+    }
+
+    let console_info = ConsoleInfo {
+        consoles: consoles,
         serial: match vmconfig.serial.mode {
             ConsoleOutputMode::File => {
                 let file = File::create(vmconfig.serial.file.as_ref().unwrap())
