@@ -2443,13 +2443,13 @@ mod unit_tests {
             fs: None,
             pmem: None,
             serial: ConsoleConfig {
-                file: None,
+                output_file: None,
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
                 socket: None,
             },
             console: ConsoleConfig {
-                file: None,
+                output_file: None,
                 // Caution: Don't use `Tty` to not mess with users terminal
                 mode: ConsoleOutputMode::Off,
                 iommu: false,

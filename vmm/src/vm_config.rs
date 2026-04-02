@@ -508,7 +508,7 @@ pub enum ConsoleOutputMode {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConsoleConfig {
     #[serde(default = "default_consoleconfig_file")]
-    pub file: Option<PathBuf>,
+    pub output_file: Option<PathBuf>,
     pub mode: ConsoleOutputMode,
     #[serde(default)]
     pub iommu: bool,
@@ -521,8 +521,8 @@ pub fn default_consoleconfig_file() -> Option<PathBuf> {
 
 impl ApplyLandlock for ConsoleConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        if let Some(file) = &self.file {
-            landlock.add_rule_with_access(file, "rw")?;
+        if let Some(output_file) = &self.output_file {
+            landlock.add_rule_with_access(output_file, "rw")?;
         }
         if let Some(socket) = &self.socket {
             landlock.add_rule_with_access(socket, "rw")?;
@@ -870,7 +870,7 @@ impl ApplyLandlock for PayloadConfig {
 
 pub fn default_serial() -> ConsoleConfig {
     ConsoleConfig {
-        file: None,
+        output_file: None,
         mode: ConsoleOutputMode::Null,
         iommu: false,
         socket: None,
@@ -879,7 +879,7 @@ pub fn default_serial() -> ConsoleConfig {
 
 pub fn default_console() -> ConsoleConfig {
     ConsoleConfig {
-        file: None,
+        output_file: None,
         mode: ConsoleOutputMode::Tty,
         iommu: false,
         socket: None,
