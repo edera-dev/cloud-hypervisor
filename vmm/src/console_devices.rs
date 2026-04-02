@@ -58,6 +58,7 @@ type ConsoleDeviceResult<T> = result::Result<T, ConsoleDeviceError>;
 #[derive(Clone)]
 pub enum ConsoleTransport {
     File(Arc<File>),
+    FilePair(Arc<File>, Arc<File>),
     Pty(Arc<File>),
     Tty(Arc<File>),
     Null,
@@ -185,9 +186,16 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
     for console in vmconfig.consoles.iter_mut() {
         let console_transport = match console.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(console.output_file.as_ref().unwrap())
+                let output_file = File::create(console.output_file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                ConsoleTransport::File(Arc::new(file))
+                match console.input_file.as_ref() {
+                    Some(input_file_path) => {
+                        let input_file = File::open(&input_file_path)
+                            .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
+                        ConsoleTransport::FilePair(Arc::new(output_file), Arc::new(input_file))
+                    }
+                    None => ConsoleTransport::File(Arc::new(output_file)),
+                }
             }
             ConsoleOutputMode::Pty => {
                 let (main_fd, sub_fd, path) =
@@ -239,9 +247,16 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         consoles: consoles,
         serial: match vmconfig.serial.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.serial.output_file.as_ref().unwrap())
+                let output_file = File::create(vmconfig.serial.output_file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                ConsoleTransport::File(Arc::new(file))
+                match vmconfig.serial.input_file.as_ref() {
+                    Some(input_file_path) => {
+                        let input_file = File::open(&input_file_path)
+                            .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
+                        ConsoleTransport::FilePair(Arc::new(output_file), Arc::new(input_file))
+                    }
+                    None => ConsoleTransport::File(Arc::new(output_file)),
+                }
             }
             ConsoleOutputMode::Pty => {
                 let (main_fd, sub_fd, path) =

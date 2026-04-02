@@ -2702,12 +2702,14 @@ mod unit_tests {
             pmem: None,
             serial: ConsoleConfig {
                 output_file: None,
+                input_file: None,
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
                 socket: None,
             },
             consoles: vec![ConsoleConfig {
                 output_file: None,
+                input_file: None,
                 // Caution: Don't use `Tty` to not mess with users terminal
                 mode: ConsoleOutputMode::Off,
                 iommu: false,

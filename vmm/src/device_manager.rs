@@ -2373,6 +2373,9 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Option<Arc<virtio_devices::ConsoleResizer>>> {
         let endpoint = match transport {
             ConsoleTransport::File(file) => Endpoint::File(file),
+            ConsoleTransport::FilePair(output_file, input_file) => {
+                Endpoint::FilePair(output_file, input_file)
+            }
             ConsoleTransport::Pty(file) => {
                 self.console_resize_pipe = resize_pipe;
                 Endpoint::PtyPair(Arc::new(file.try_clone().unwrap()), file)
@@ -2472,6 +2475,9 @@ impl DeviceManager {
             ConsoleTransport::File(ref file) | ConsoleTransport::Tty(ref file) => {
                 Some(Box::new(Arc::clone(file)))
             }
+            ConsoleTransport::FilePair(ref output_file, ref _input_file) => {
+                Some(Box::new(Arc::clone(output_file)))
+            }
             ConsoleTransport::Off
             | ConsoleTransport::Null
             | ConsoleTransport::Pty(_)
@@ -2508,6 +2514,7 @@ impl DeviceManager {
         {
             let debug_console_writer: Option<Box<dyn io::Write + Send>> = match console_info.debug {
                 ConsoleTransport::File(file) | ConsoleTransport::Tty(file) => Some(Box::new(file)),
+                ConsoleTransport::FilePair(output_file, _input_file) => Some(Box::new(output_file)),
                 ConsoleTransport::Off
                 | ConsoleTransport::Null
                 | ConsoleTransport::Pty(_)
