@@ -2335,7 +2335,7 @@ impl CommonConsoleConfig {
             .add_all(Self::VALUE_OPTIONS);
         parser.parse_subset(console).map_err(map_err)?;
 
-        let mut file: Option<PathBuf> = None;
+        let mut output_file: Option<PathBuf> = None;
         let mut socket: Option<PathBuf> = None;
         let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
 
@@ -2348,7 +2348,7 @@ impl CommonConsoleConfig {
             mode = ConsoleOutputMode::Null;
         } else if parser.is_set("file") {
             mode = ConsoleOutputMode::File;
-            file =
+            output_file =
                 Some(PathBuf::from(parser.get("file").ok_or(
                     Error::Validation(ValidationError::ConsoleFileMissing),
                 )?));
@@ -2361,7 +2361,11 @@ impl CommonConsoleConfig {
             return Err(Error::ParseConsoleInvalidModeGiven);
         }
 
-        Ok(Self { mode, file, socket })
+        Ok(Self {
+            mode,
+            output_file,
+            socket,
+        })
     }
 }
 
@@ -3141,12 +3145,15 @@ impl VmConfig {
             warn!("Using TTY output for multiple consoles: {tty_consoles:?}");
         }
 
-        if self.console.common.mode == ConsoleOutputMode::File && self.console.common.file.is_none()
+        if self.console.common.mode == ConsoleOutputMode::File
+            && self.console.common.output_file.is_none()
         {
             return Err(ValidationError::ConsoleFileMissing);
         }
 
-        if self.serial.common.mode == ConsoleOutputMode::File && self.serial.common.file.is_none() {
+        if self.serial.common.mode == ConsoleOutputMode::File
+            && self.serial.common.output_file.is_none()
+        {
             return Err(ValidationError::ConsoleFileMissing);
         }
 
@@ -4724,8 +4731,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_console_parsing() -> Result<()> {
-        let console_config = |mode, file, socket, iommu| ConsoleConfig {
-            common: CommonConsoleConfig { file, mode, socket },
+        let console_config = |mode, output_file, socket, iommu| ConsoleConfig {
+            common: CommonConsoleConfig {
+                output_file,
+                mode,
+                socket,
+            },
             pci_common: PciDeviceCommonConfig {
                 iommu,
                 ..Default::default()
@@ -5419,14 +5430,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pmem: None,
             serial: SerialConfig {
                 common: CommonConsoleConfig {
-                    file: None,
+                    output_file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
                 },
             },
             console: ConsoleConfig {
                 common: CommonConsoleConfig {
-                    file: None,
+                    output_file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
                 },
@@ -5502,7 +5513,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.serial.common.mode = ConsoleOutputMode::File;
-        invalid_config.serial.common.file = None;
+        invalid_config.serial.common.output_file = None;
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::ConsoleFileMissing)
