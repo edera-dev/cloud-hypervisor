@@ -183,7 +183,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
     let console_info = ConsoleInfo {
         console: match vmconfig.console.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.console.common.file.as_ref().unwrap())
+                let file = File::create(vmconfig.console.common.output_file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -191,7 +191,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 set_raw_mode(&sub_fd.as_raw_fd(), &mut original_termios_opt)?;
-                vmconfig.console.common.file = Some(path.clone());
+                vmconfig.console.common.output_file = Some(path.clone());
                 vmm.console_resize_pipe = Some(Arc::new(
                     listen_for_sigwinch_on_tty(
                         sub_fd,
@@ -232,7 +232,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         },
         serial: match vmconfig.serial.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.serial.common.file.as_ref().unwrap())
+                let file = File::create(vmconfig.serial.common.output_file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -240,7 +240,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 set_raw_mode(&sub_fd.as_raw_fd(), &mut original_termios_opt)?;
-                vmconfig.serial.common.file = Some(path.clone());
+                vmconfig.serial.common.output_file = Some(path.clone());
                 ConsoleTransport::Pty(Arc::new(main_fd))
             }
             ConsoleOutputMode::Tty => {

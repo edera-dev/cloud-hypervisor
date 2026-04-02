@@ -1014,14 +1014,14 @@ mod unit_tests {
             pmem: None,
             serial: SerialConfig {
                 common: CommonConsoleConfig {
-                    file: None,
+                    output_file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
                 },
             },
             console: ConsoleConfig {
                 common: CommonConsoleConfig {
-                    file: None,
+                    output_file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
                 },
@@ -1750,6 +1750,23 @@ mod unit_tests {
                 ],
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"}
+                }"#,
+                true,
+            ),
+            (
+                vec![
+                    "cloud-hypervisor",
+                    "--kernel",
+                    "/path/to/kernel",
+                    "--serial",
+                    "pty",
+                    "--console",
+                    "file=/path/to/console",
+                ],
+                r#"{
+                    "payload": {"kernel": "/path/to/kernel"},
+                    "serial": {"mode": "Pty"},
+                    "console": {"mode": "File", "output_file": "/path/to/console"}
                 }"#,
                 true,
             ),
