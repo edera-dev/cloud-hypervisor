@@ -1001,12 +1001,14 @@ mod unit_tests {
             pmem: None,
             serial: ConsoleConfig {
                 output_file: None,
+                input_file: None,
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
                 socket: None,
             },
             console: ConsoleConfig {
                 output_file: None,
+                input_file: None,
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
                 socket: None,

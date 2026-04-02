@@ -183,6 +183,8 @@ pub enum ValidationError {
     /// Missing file value for console
     #[error("Path missing when using file console mode")]
     ConsoleFileMissing,
+    #[error("Console input is not supported by this endpoint")]
+    ConsoleInputUnsupported,
     /// Missing socket path for console
     #[error("Path missing when using socket console mode")]
     ConsoleSocketPathMissing,
@@ -1887,10 +1889,12 @@ impl ConsoleConfig {
             .add_valueless("null")
             .add("file")
             .add("iommu")
-            .add("socket");
+            .add("socket")
+            .add("input_file");
         parser.parse(console).map_err(Error::ParseConsole)?;
 
         let mut output_file: Option<PathBuf> = default_consoleconfig_file();
+        let mut input_file: Option<PathBuf> = None;
         let mut socket: Option<PathBuf> = None;
         let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
 
@@ -1907,6 +1911,7 @@ impl ConsoleConfig {
                 Some(PathBuf::from(parser.get("file").ok_or(
                     Error::Validation(ValidationError::ConsoleFileMissing),
                 )?));
+            input_file = parser.get("input_file").map(PathBuf::from);
         } else if parser.is_set("socket") {
             mode = ConsoleOutputMode::Socket;
             socket = Some(PathBuf::from(parser.get("socket").ok_or(
@@ -1923,6 +1928,7 @@ impl ConsoleConfig {
 
         Ok(Self {
             output_file,
+            input_file,
             mode,
             iommu,
             socket,
@@ -2654,10 +2660,14 @@ impl VmConfig {
 
         if self.console.mode == ConsoleOutputMode::File && self.console.output_file.is_none() {
             return Err(ValidationError::ConsoleFileMissing);
+        } else if self.console.mode != ConsoleOutputMode::File && self.console.input_file.is_some() {
+            return Err(ValidationError::ConsoleInputUnsupported);
         }
 
         if self.serial.mode == ConsoleOutputMode::File && self.serial.output_file.is_none() {
             return Err(ValidationError::ConsoleFileMissing);
+        } else if self.serial.mode != ConsoleOutputMode::File && self.serial.input_file.is_some() {
+            return Err(ValidationError::ConsoleInputUnsupported);
         }
 
         if self.cpus.max_vcpus < self.cpus.boot_vcpus {
@@ -3833,6 +3843,7 @@ mod unit_tests {
                 mode: ConsoleOutputMode::Off,
                 iommu: false,
                 output_file: None,
+                input_file: None,
                 socket: None,
             }
         );
@@ -3842,6 +3853,7 @@ mod unit_tests {
                 mode: ConsoleOutputMode::Pty,
                 iommu: false,
                 output_file: None,
+                input_file: None,
                 socket: None,
             }
         );
@@ -3851,6 +3863,7 @@ mod unit_tests {
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
                 output_file: None,
+                input_file: None,
                 socket: None,
             }
         );
@@ -3860,6 +3873,7 @@ mod unit_tests {
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
                 output_file: None,
+                input_file: None,
                 socket: None,
             }
         );
@@ -3869,6 +3883,17 @@ mod unit_tests {
                 mode: ConsoleOutputMode::File,
                 iommu: false,
                 output_file: Some(PathBuf::from("/tmp/console")),
+                input_file: None,
+                socket: None,
+            }
+        );
+        assert_eq!(
+            ConsoleConfig::parse("file=/tmp/console_out,input_file=/tmp/console_in")?,
+            ConsoleConfig {
+                mode: ConsoleOutputMode::File,
+                iommu: false,
+                output_file: Some(PathBuf::from("/tmp/console_out")),
+                input_file: Some(PathBuf::from("/tmp/console_in")),
                 socket: None,
             }
         );
@@ -3878,6 +3903,7 @@ mod unit_tests {
                 mode: ConsoleOutputMode::Null,
                 iommu: true,
                 output_file: None,
+                input_file: None,
                 socket: None,
             }
         );
@@ -3887,6 +3913,7 @@ mod unit_tests {
                 mode: ConsoleOutputMode::File,
                 iommu: true,
                 output_file: Some(PathBuf::from("/tmp/console")),
+                input_file: None,
                 socket: None,
             }
         );
@@ -3896,6 +3923,7 @@ mod unit_tests {
                 mode: ConsoleOutputMode::Socket,
                 iommu: true,
                 output_file: None,
+                input_file: None,
                 socket: Some(PathBuf::from("/tmp/serial.sock")),
             }
         );
@@ -4376,12 +4404,14 @@ mod unit_tests {
             pmem: None,
             serial: ConsoleConfig {
                 output_file: None,
+                input_file: None,
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
                 socket: None,
             },
             console: ConsoleConfig {
                 output_file: None,
+                input_file: None,
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
                 socket: None,
@@ -4432,6 +4462,13 @@ mod unit_tests {
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::ConsoleFileMissing)
+        );
+
+        invalid_config.serial.mode = ConsoleOutputMode::Pty;
+        invalid_config.serial.input_file = Some(PathBuf::from("/dev/null"));
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ConsoleInputUnsupported)
         );
 
         let mut invalid_config = valid_config.clone();
