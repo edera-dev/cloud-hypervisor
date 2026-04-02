@@ -185,7 +185,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
     for console in vmconfig.consoles.iter_mut() {
         let console_transport = match console.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(console.file.as_ref().unwrap())
+                let file = File::create(console.output_file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -193,7 +193,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 set_raw_mode(&sub_fd.as_raw_fd(), &mut original_termios_opt)?;
-                console.file = Some(path.clone());
+                console.output_file = Some(path.clone());
                 vmm.console_resize_pipe = Some(Arc::new(
                     listen_for_sigwinch_on_tty(
                         sub_fd,
@@ -239,7 +239,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         consoles: consoles,
         serial: match vmconfig.serial.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.serial.file.as_ref().unwrap())
+                let file = File::create(vmconfig.serial.output_file.as_ref().unwrap())
                     .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 ConsoleTransport::File(Arc::new(file))
             }
@@ -247,7 +247,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 set_raw_mode(&sub_fd.as_raw_fd(), &mut original_termios_opt)?;
-                vmconfig.serial.file = Some(path.clone());
+                vmconfig.serial.output_file = Some(path.clone());
                 ConsoleTransport::Pty(Arc::new(main_fd))
             }
             ConsoleOutputMode::Tty => {

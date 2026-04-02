@@ -2126,7 +2126,7 @@ impl ConsoleConfig {
             .add("socket");
         parser.parse(console).map_err(Error::ParseConsole)?;
 
-        let mut file: Option<PathBuf> = default_consoleconfig_file();
+        let mut output_file: Option<PathBuf> = default_consoleconfig_file();
         let mut socket: Option<PathBuf> = None;
         let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
 
@@ -2139,7 +2139,7 @@ impl ConsoleConfig {
             mode = ConsoleOutputMode::Null;
         } else if parser.is_set("file") {
             mode = ConsoleOutputMode::File;
-            file =
+            output_file =
                 Some(PathBuf::from(parser.get("file").ok_or(
                     Error::Validation(ValidationError::ConsoleFileMissing),
                 )?));
@@ -2158,7 +2158,7 @@ impl ConsoleConfig {
             .0;
 
         Ok(Self {
-            file,
+            output_file,
             mode,
             iommu,
             socket,
@@ -2874,12 +2874,12 @@ impl VmConfig {
         }
 
         for console in self.consoles.iter() {
-            if console.mode == ConsoleOutputMode::File && console.file.is_none() {
+            if console.mode == ConsoleOutputMode::File && console.output_file.is_none() {
                 return Err(ValidationError::ConsoleFileMissing);
             }
         }
 
-        if self.serial.mode == ConsoleOutputMode::File && self.serial.file.is_none() {
+        if self.serial.mode == ConsoleOutputMode::File && self.serial.output_file.is_none() {
             return Err(ValidationError::ConsoleFileMissing);
         }
 
@@ -4335,7 +4335,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::Off,
                 iommu: false,
-                file: None,
+                output_file: None,
                 socket: None,
             }
         );
@@ -4344,7 +4344,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::Pty,
                 iommu: false,
-                file: None,
+                output_file: None,
                 socket: None,
             }
         );
@@ -4353,7 +4353,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
-                file: None,
+                output_file: None,
                 socket: None,
             }
         );
@@ -4362,7 +4362,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
-                file: None,
+                output_file: None,
                 socket: None,
             }
         );
@@ -4371,7 +4371,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::File,
                 iommu: false,
-                file: Some(PathBuf::from("/tmp/console")),
+                output_file: Some(PathBuf::from("/tmp/console")),
                 socket: None,
             }
         );
@@ -4380,7 +4380,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::Null,
                 iommu: true,
-                file: None,
+                output_file: None,
                 socket: None,
             }
         );
@@ -4389,7 +4389,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::File,
                 iommu: true,
-                file: Some(PathBuf::from("/tmp/console")),
+                output_file: Some(PathBuf::from("/tmp/console")),
                 socket: None,
             }
         );
@@ -4398,7 +4398,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig {
                 mode: ConsoleOutputMode::Socket,
                 iommu: true,
-                file: None,
+                output_file: None,
                 socket: Some(PathBuf::from("/tmp/serial.sock")),
             }
         );
@@ -4957,13 +4957,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             generic_vhost_user: None,
             pmem: None,
             serial: ConsoleConfig {
-                file: None,
+                output_file: None,
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
                 socket: None,
             },
             consoles: vec![ConsoleConfig {
-                file: None,
+                output_file: None,
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
                 socket: None,
@@ -5037,7 +5037,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.serial.mode = ConsoleOutputMode::File;
-        invalid_config.serial.file = None;
+        invalid_config.serial.output_file = None;
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::ConsoleFileMissing)

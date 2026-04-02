@@ -1049,13 +1049,13 @@ mod unit_tests {
             generic_vhost_user: None,
             pmem: None,
             serial: ConsoleConfig {
-                file: None,
+                output_file: None,
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
                 socket: None,
             },
             consoles: vec![ConsoleConfig {
-                file: None,
+                output_file: None,
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
                 socket: None,
@@ -1798,7 +1798,7 @@ mod unit_tests {
                 r#"{
                     "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Pty"},
-                    "consoles": [{"mode": "Tty"}, {"mode": "File", "file": "/path/to/console"}]
+                    "consoles": [{"mode": "Tty"}, {"mode": "File", "output_file": "/path/to/console"}]
                 }"#,
                 true,
             ),
