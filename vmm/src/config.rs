@@ -222,6 +222,8 @@ pub enum ValidationError {
     /// Missing file value for console
     #[error("Path missing when using file console mode")]
     ConsoleFileMissing,
+    #[error("Console input is not supported by this endpoint")]
+    ConsoleInputUnsupported,
     /// Missing socket path for console
     #[error("Path missing when using socket console mode")]
     ConsoleSocketPathMissing,
@@ -2142,7 +2144,7 @@ impl PmemConfig {
 
 impl CommonConsoleConfig {
     const VALUELESS_OPTIONS: &[&str] = &["off", "pty", "tty", "null"];
-    const VALUE_OPTIONS: &[&str] = &["file", "socket"];
+    const VALUE_OPTIONS: &[&str] = &["file", "socket", "input_file"];
 
     fn parse(console: &str, map_err: impl Fn(OptionParserError) -> Error) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2152,6 +2154,7 @@ impl CommonConsoleConfig {
         parser.parse_subset(console).map_err(map_err)?;
 
         let mut output_file: Option<PathBuf> = None;
+        let mut input_file: Option<PathBuf> = None;
         let mut socket: Option<PathBuf> = None;
         let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
 
@@ -2168,6 +2171,7 @@ impl CommonConsoleConfig {
                 Some(PathBuf::from(parser.get("file").ok_or(
                     Error::Validation(ValidationError::ConsoleFileMissing),
                 )?));
+            input_file = parser.get("input_file").map(PathBuf::from);
         } else if parser.is_set("socket") {
             mode = ConsoleOutputMode::Socket;
             socket = Some(PathBuf::from(parser.get("socket").ok_or(
@@ -2180,6 +2184,7 @@ impl CommonConsoleConfig {
         Ok(Self {
             mode,
             output_file,
+            input_file,
             socket,
         })
     }
@@ -2943,12 +2948,20 @@ impl VmConfig {
             && self.console.common.output_file.is_none()
         {
             return Err(ValidationError::ConsoleFileMissing);
+        } else if self.console.common.mode != ConsoleOutputMode::File
+            && self.console.common.input_file.is_some()
+        {
+            return Err(ValidationError::ConsoleInputUnsupported);
         }
 
         if self.serial.common.mode == ConsoleOutputMode::File
             && self.serial.common.output_file.is_none()
         {
             return Err(ValidationError::ConsoleFileMissing);
+        } else if self.serial.common.mode != ConsoleOutputMode::File
+            && self.serial.common.input_file.is_some()
+        {
+            return Err(ValidationError::ConsoleInputUnsupported);
         }
 
         if self.cpus.max_vcpus < self.cpus.boot_vcpus {
@@ -4418,9 +4431,10 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_console_parsing() -> Result<()> {
-        let console_config = |mode, output_file, socket, iommu| ConsoleConfig {
+        let console_config = |mode, output_file, input_file, socket, iommu| ConsoleConfig {
             common: CommonConsoleConfig {
                 output_file,
+                input_file,
                 mode,
                 socket,
             },
@@ -4434,19 +4448,19 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         ConsoleConfig::parse("badmode").unwrap_err();
         assert_eq!(
             ConsoleConfig::parse("off")?,
-            console_config(ConsoleOutputMode::Off, None, None, false)
+            console_config(ConsoleOutputMode::Off, None, None, None, false)
         );
         assert_eq!(
             ConsoleConfig::parse("pty")?,
-            console_config(ConsoleOutputMode::Pty, None, None, false)
+            console_config(ConsoleOutputMode::Pty, None, None, None, false)
         );
         assert_eq!(
             ConsoleConfig::parse("tty")?,
-            console_config(ConsoleOutputMode::Tty, None, None, false)
+            console_config(ConsoleOutputMode::Tty, None, None, None, false)
         );
         assert_eq!(
             ConsoleConfig::parse("null")?,
-            console_config(ConsoleOutputMode::Null, None, None, false)
+            console_config(ConsoleOutputMode::Null, None, None, None, false)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console")?,
@@ -4454,18 +4468,30 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ConsoleOutputMode::File,
                 Some(PathBuf::from("/tmp/console")),
                 None,
+                None,
+                false
+            )
+        );
+        assert_eq!(
+            ConsoleConfig::parse("file=/tmp/console_out,input_file=/tmp/console_in")?,
+            console_config(
+                ConsoleOutputMode::File,
+                Some(PathBuf::from("/tmp/console_out")),
+                Some(PathBuf::from("/tmp/console_in")),
+                None,
                 false
             )
         );
         assert_eq!(
             ConsoleConfig::parse("null,iommu=on")?,
-            console_config(ConsoleOutputMode::Null, None, None, true)
+            console_config(ConsoleOutputMode::Null, None, None, None, true)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console,iommu=on")?,
             console_config(
                 ConsoleOutputMode::File,
                 Some(PathBuf::from("/tmp/console")),
+                None,
                 None,
                 true
             )
@@ -4474,6 +4500,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig::parse("socket=/tmp/serial.sock,iommu=on")?,
             console_config(
                 ConsoleOutputMode::Socket,
+                None,
                 None,
                 Some(PathBuf::from("/tmp/serial.sock")),
                 true
@@ -5060,6 +5087,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             serial: SerialConfig {
                 common: CommonConsoleConfig {
                     output_file: None,
+                    input_file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
                 },
@@ -5067,6 +5095,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             console: ConsoleConfig {
                 common: CommonConsoleConfig {
                     output_file: None,
+                    input_file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
                 },
@@ -5145,6 +5174,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::ConsoleFileMissing)
+        );
+
+        invalid_config.serial.common.mode = ConsoleOutputMode::Pty;
+        invalid_config.serial.common.input_file = Some(PathBuf::from("/dev/null"));
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ConsoleInputUnsupported)
         );
 
         let mut invalid_config = valid_config.clone();

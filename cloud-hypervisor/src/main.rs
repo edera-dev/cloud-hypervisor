@@ -1015,6 +1015,7 @@ mod unit_tests {
             serial: SerialConfig {
                 common: CommonConsoleConfig {
                     output_file: None,
+                    input_file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
                 },
@@ -1022,6 +1023,7 @@ mod unit_tests {
             console: ConsoleConfig {
                 common: CommonConsoleConfig {
                     output_file: None,
+                    input_file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
                 },
