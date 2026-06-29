@@ -215,6 +215,58 @@ pub fn get_max_x2apic_id(topology: (u16, u16, u16, u16)) -> u32 {
     )
 }
 
+/// Per-vCPU x2APIC ID for a (possibly unbalanced) vNUMA layout.
+///
+/// [`get_x2apic_id`] derives the package from `cpu_id / (threads*cores*dies)`,
+/// i.e. it can only carve equal-sized packages -- so it cannot place an
+/// unbalanced NUMA layout (e.g. 4+3 vCPUs) such that each guest package maps to
+/// one node. This mirrors Xen's `guest_vcpu_x2apic_id`: each node occupies a
+/// power-of-two-sized window of APIC IDs (sized to the largest node, which the
+/// caller encodes as `cores_per_die`), and a vCPU's ID is
+/// `(node << pkg_shift) | (offset_within_node << thread_width)`. Under-filled
+/// nodes leave the tail of their window unused.
+///
+/// The node index is the proximity domain (guest NUMA id) and the offset is the
+/// vCPU's position in that node's CPU list, so any vCPU->node assignment works.
+/// Falls back to the uniform encoding when there is no usable multi-node layout
+/// (no topology, <=1 node, or an unassigned vCPU); for a balanced layout the
+/// window encoding is bit-identical to the uniform one anyway.
+pub fn vcpu_x2apic_id(
+    cpu_id: u32,
+    topology: Option<(u16, u16, u16, u16)>,
+    numa_nodes: &crate::NumaNodes,
+) -> u32 {
+    let Some((threads, cores, dies, _packages)) = topology else {
+        return get_x2apic_id(cpu_id, topology);
+    };
+    if numa_nodes.len() <= 1 {
+        return get_x2apic_id(cpu_id, topology);
+    }
+
+    // Locate the vCPU's node (proximity domain) and its offset within that
+    // node's CPU list.
+    let mut found: Option<(u32, u32)> = None;
+    for (node_id, node) in numa_nodes.iter() {
+        if let Some(pos) = node.cpus.iter().position(|&c| c == cpu_id) {
+            found = Some((*node_id, pos as u32));
+            break;
+        }
+    }
+    let Some((node_id, offset)) = found else {
+        return get_x2apic_id(cpu_id, topology);
+    };
+
+    // Package window shift, matching the field widths get_x2apic_id /
+    // update_cpuid_topology derive from the same tuple, so the APIC IDs agree
+    // with the CPUID topology leaves the guest reads.
+    let thread_width = u16::BITS - (threads - 1).leading_zeros();
+    let core_width = u16::BITS - (cores - 1).leading_zeros();
+    let die_width = u16::BITS - (dies - 1).leading_zeros();
+    let pkg_shift = thread_width + core_width + die_width;
+
+    (node_id << pkg_shift) | (offset << thread_width)
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum CpuidReg {
     EAX,
@@ -939,8 +991,11 @@ pub fn configure_vcpu(
     topology: (u16, u16, u16, u16),
     nested: bool,
     setup_registers: bool,
+    // Precomputed x2APIC ID for vNUMA-aware (possibly unbalanced) layouts; when
+    // None the uniform encoding is derived from `topology` as before.
+    x2apic_id_override: Option<u32>,
 ) -> super::Result<()> {
-    let x2apic_id = get_x2apic_id(id, Some(topology));
+    let x2apic_id = x2apic_id_override.unwrap_or_else(|| get_x2apic_id(id, Some(topology)));
 
     // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
     let mut cpuid = cpuid;
@@ -976,7 +1031,14 @@ pub fn configure_vcpu(
     assert!(apic_id_patched);
 
     update_cpuid_topology(
-        &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
+        &mut cpuid,
+        topology.0,
+        topology.1,
+        topology.2,
+        topology.3,
+        cpu_vendor,
+        id,
+        x2apic_id_override,
     );
 
     // The TSC frequency CPUID leaf should not be included when running with HyperV emulation
@@ -1442,6 +1504,7 @@ pub fn get_host_cpu_phys_bits(_hypervisor: &dyn hypervisor::Hypervisor) -> u8 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_cpuid_topology(
     cpuid: &mut Vec<CpuIdEntry>,
     threads_per_core: u16,
@@ -1450,11 +1513,14 @@ fn update_cpuid_topology(
     packages: u16,
     cpu_vendor: CpuVendor,
     id: u32,
+    x2apic_id_override: Option<u32>,
 ) {
-    let x2apic_id = get_x2apic_id(
-        id,
-        Some((threads_per_core, cores_per_die, dies_per_package, packages)),
-    );
+    let x2apic_id = x2apic_id_override.unwrap_or_else(|| {
+        get_x2apic_id(
+            id,
+            Some((threads_per_core, cores_per_die, dies_per_package, packages)),
+        )
+    });
 
     // Note: the topology defined here is per "package" (~NUMA node).
     let thread_width = u16::BITS - (threads_per_core - 1).leading_zeros();
@@ -1916,5 +1982,69 @@ mod unit_tests {
         assert_eq!(cache_sharing(&cpuid, LEAF, 2), 2);
         // The LLC spans the package: 2 threads * 4 cores * 1 die = 8.
         assert_eq!(cache_sharing(&cpuid, LEAF, 3), 8);
+    }
+
+    fn numa_nodes(groups: &[&[u32]]) -> crate::NumaNodes {
+        let mut nodes = crate::NumaNodes::new();
+        for (i, cpus) in groups.iter().enumerate() {
+            nodes.insert(
+                i as u32,
+                crate::NumaNode {
+                    cpus: cpus.to_vec(),
+                    ..Default::default()
+                },
+            );
+        }
+        nodes
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_balanced_matches_uniform() {
+        // For a balanced layout the window encoding is bit-identical to the
+        // uniform one, so existing (balanced) guests are unaffected.
+        let topo = (1u16, 2u16, 1u16, 2u16);
+        let nodes = numa_nodes(&[&[0, 1], &[2, 3]]);
+        for cpu in 0..4 {
+            assert_eq!(
+                vcpu_x2apic_id(cpu, Some(topo), &nodes),
+                get_x2apic_id(cpu, Some(topo)),
+            );
+        }
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_unbalanced_two_nodes() {
+        // 3 + 4 vCPUs: cores_per_die = largest node = 4 -> pkg_shift 2. Node 0
+        // (the short one) leaves APIC ID 3 unused.
+        let topo = (1u16, 4u16, 1u16, 2u16);
+        let nodes = numa_nodes(&[&[0, 1, 2], &[3, 4, 5, 6]]);
+        let ids: Vec<u32> = (0..7)
+            .map(|c| vcpu_x2apic_id(c, Some(topo), &nodes))
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_unbalanced_three_nodes() {
+        // 3 + 2 + 2 vCPUs: cores_per_die = 3 -> pkg_shift 2. Each node's window
+        // is 4 APIC IDs wide; the two short nodes leave their tails unused.
+        let topo = (1u16, 3u16, 1u16, 3u16);
+        let nodes = numa_nodes(&[&[0, 1, 2], &[3, 4], &[5, 6]]);
+        let ids: Vec<u32> = (0..7)
+            .map(|c| vcpu_x2apic_id(c, Some(topo), &nodes))
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 4, 5, 8, 9]);
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_single_node_falls_back() {
+        let topo = (1u16, 4u16, 1u16, 1u16);
+        let nodes = numa_nodes(&[&[0, 1, 2, 3]]);
+        for cpu in 0..4 {
+            assert_eq!(
+                vcpu_x2apic_id(cpu, Some(topo), &nodes),
+                get_x2apic_id(cpu, Some(topo)),
+            );
+        }
     }
 }

@@ -446,7 +446,7 @@ fn create_srat_table(
 
         for cpu in &node.cpus {
             #[cfg(target_arch = "x86_64")]
-            let x2apic_id = arch::x86_64::get_x2apic_id(*cpu, topology);
+            let x2apic_id = arch::x86_64::vcpu_x2apic_id(*cpu, topology, numa_nodes);
             #[cfg(target_arch = "aarch64")]
             let x2apic_id = *cpu;
 
