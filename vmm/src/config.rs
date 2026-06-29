@@ -3100,11 +3100,16 @@ impl VmConfig {
                 return Err(ValidationError::CpuTopologyDiesPerPackage);
             }
 
+            // The topology must describe at least as many slots as there are
+            // vCPUs. It may describe more: a vNUMA layout sizes cores_per_die to
+            // the largest node and gives every node a package window of that
+            // size, so unbalanced nodes leave the tail of their window empty
+            // (their APIC IDs are placed accordingly -- see vcpu_x2apic_id).
             let total: u32 = (t.threads_per_core as u32)
                 * (t.cores_per_die as u32)
                 * (t.dies_per_package as u32)
                 * (t.packages as u32);
-            if total != self.cpus.max_vcpus {
+            if total < self.cpus.max_vcpus {
                 return Err(ValidationError::CpuTopologyCount);
             }
         }
@@ -5191,12 +5196,15 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::CpusMaxLowerThanBoot(16, 32))
         );
 
+        // A topology describing fewer slots than max_vcpus is rejected. (More
+        // slots than vCPUs is allowed: a vNUMA layout over-provisions package
+        // windows for unbalanced nodes.)
         let mut invalid_config = valid_config.clone();
         invalid_config.cpus.max_vcpus = 16;
         invalid_config.cpus.boot_vcpus = 16;
         invalid_config.cpus.topology = Some(CpuTopology {
-            threads_per_core: 2,
-            cores_per_die: 8,
+            threads_per_core: 1,
+            cores_per_die: 4,
             dies_per_package: 1,
             packages: 2,
         });
@@ -5204,6 +5212,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::CpuTopologyCount)
         );
+
+        // Over-provisioned topology (more slots than vCPUs) is now valid.
+        let mut over_provisioned = valid_config.clone();
+        over_provisioned.cpus.max_vcpus = 16;
+        over_provisioned.cpus.boot_vcpus = 16;
+        over_provisioned.cpus.topology = Some(CpuTopology {
+            threads_per_core: 2,
+            cores_per_die: 8,
+            dies_per_package: 1,
+            packages: 2,
+        });
+        over_provisioned.validate().unwrap();
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.cpus.max_vcpus = 8;
