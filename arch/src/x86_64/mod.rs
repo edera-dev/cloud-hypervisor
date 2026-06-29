@@ -1765,7 +1765,88 @@ fn update_cpuid_topology(
             CpuidPatch::set_cpuid_reg(cpuid, 0x8000_0008, Some(0), CpuidReg::ECX, 0u32);
         }
     }
+
+    // Our vNUMA layout maps one guest package per NUMA node. The cache leaves
+    // are inherited verbatim from the host (KVM_GET_SUPPORTED_CPUID) and still
+    // describe the host's last-level cache span (e.g. a whole CCX), so on a
+    // multi-package layout the guest sees an LLC that crosses node boundaries
+    // and the kernel warns:
+    //   "sched: CPU #N's llc-sibling CPU #M is not on the same node!".
+    // Re-derive the cache-sharing topology from the synthesized layout so the
+    // LLC stays contained within a package (== a vNUMA node). Single-package
+    // guests keep the host's cache topology, which is already consistent.
+    if packages > 1 {
+        update_cpuid_cache_topology(
+            cpuid,
+            threads_per_core,
+            cores_per_die,
+            dies_per_package,
+            cpu_vendor,
+        );
+    }
 }
+
+/// Re-derive the deterministic cache topology leaf so each cache level's
+/// "logical processors sharing this cache" field reflects the synthesized CPU
+/// topology rather than the host's.
+///
+/// The leaf has an identical layout on Intel (`0x4`) and AMD (`0x8000_001d`):
+///   EAX[4:0]   cache type (0 = no further caches at this subleaf)
+///   EAX[7:5]   cache level (1, 2, 3, ...)
+///   EAX[25:14] max number of logical processors sharing this cache, minus 1
+///
+/// Per-core caches (levels 1-2) are shared across a core's threads; the
+/// last-level cache (level 3+) is shared across a whole package, which is how
+/// we expose a single vNUMA node. Cache geometry (size/associativity carried in
+/// the other registers) is left untouched.
+fn update_cpuid_cache_topology(
+    cpuid: &mut Vec<CpuIdEntry>,
+    threads_per_core: u16,
+    cores_per_die: u16,
+    dies_per_package: u16,
+    cpu_vendor: CpuVendor,
+) {
+    let leaf: u32 = match cpu_vendor {
+        CpuVendor::AMD => 0x8000_001d,
+        // Intel and unknown vendors use the Intel deterministic cache leaf.
+        _ => 0x4,
+    };
+
+    let threads_per_core = threads_per_core as u32;
+    let threads_per_package = threads_per_core * cores_per_die as u32 * dies_per_package as u32;
+
+    // Snapshot the subleaf indices up front so we can mutate entries in place
+    // without assuming the host enumerated them contiguously from zero.
+    let indices: Vec<u32> = cpuid
+        .iter()
+        .filter(|entry| entry.function == leaf)
+        .map(|entry| entry.index)
+        .collect();
+
+    for index in indices {
+        let Some(eax) = CpuidPatch::get_cpuid_reg(cpuid, leaf, Some(index), CpuidReg::EAX) else {
+            continue;
+        };
+
+        let cache_type = eax & 0x1f;
+        if cache_type == 0 {
+            // Null subleaf: no cache described here.
+            continue;
+        }
+        let cache_level = (eax >> 5) & 0x7;
+
+        let sharing = if cache_level <= 2 {
+            threads_per_core
+        } else {
+            threads_per_package
+        };
+
+        // Replace EAX[25:14] with (sharing - 1), preserving every other field.
+        let eax = (eax & !(0xfff << 14)) | (((sharing - 1) & 0xfff) << 14);
+        CpuidPatch::set_cpuid_reg(cpuid, leaf, Some(index), CpuidReg::EAX, eax);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use linux_loader::loader::bootparam::boot_e820_entry;
@@ -1985,6 +2066,16 @@ mod tests {
         }
     }
 
+    fn cache_entry(leaf: u32, index: u32, cache_type: u32, level: u32, sharing: u32) -> CpuIdEntry {
+        CpuIdEntry {
+            function: leaf,
+            index,
+            flags: CPUID_FLAG_VALID_INDEX,
+            eax: cache_type | (level << 5) | ((sharing - 1) << 14),
+            ..Default::default()
+        }
+    }
+
     fn sharing_field(cpuid: &[CpuIdEntry], function: u32, index: u32) -> u32 {
         let eax = CpuidPatch::get_cpuid_reg(cpuid, function, Some(index), CpuidReg::EAX).unwrap();
         (eax >> CACHE_SHARING_SHIFT) & CACHE_SHARING_MASK
@@ -1994,7 +2085,8 @@ mod tests {
     fn test_update_cpuid_cache_topology_intel() {
         // Guest topology 2:60:1:2, one die spans 128 ID slots for its
         // 120 vCPUs. The host leaf 0x4 declares a socket wide L3 of 256
-        // addressable IDs, wider than the die, so only the L3 is clamped
+        // addressable IDs, a multi-package guest derives every sharing
+        // width from its own topology
         let mut cpuid = vec![
             host_cache_subleaf(0x4, 0, 1, 1, (1 << CACHE_SHARING_SHIFT) | CACHE_SELF_INIT),
             host_cache_subleaf(0x4, 1, 1, 2, (1 << CACHE_SHARING_SHIFT) | CACHE_SELF_INIT),
@@ -2011,12 +2103,12 @@ mod tests {
         let host_l3 = cpuid[3].eax;
         update_cpuid_topology(&mut cpuid, 2, 60, 1, 2, CpuVendor::Intel, 0);
 
-        // L1 and L2 fit inside the die, the host values are kept
+        // L1 and L2 are shared across the 2 threads of a core
         assert_eq!(sharing_field(&cpuid, 0x4, 0), 1);
         assert_eq!(sharing_field(&cpuid, 0x4, 1), 1);
-        assert_eq!(sharing_field(&cpuid, 0x4, 2), 3);
-        // L3 is clamped to one die, 1 << 7 addressable IDs
-        assert_eq!(sharing_field(&cpuid, 0x4, 3), 127);
+        assert_eq!(sharing_field(&cpuid, 0x4, 2), 1);
+        // L3 is shared across the 120 vCPUs of the package
+        assert_eq!(sharing_field(&cpuid, 0x4, 3), 119);
         let l3 = CpuidPatch::get_cpuid_reg(&cpuid, 0x4, Some(3), CpuidReg::EAX).unwrap();
         // The core IDs field holds 64 core ID slots for the 60 cores
         assert_eq!((l3 >> CACHE_CORE_IDS_SHIFT) & CACHE_CORE_IDS_MASK, 63);
@@ -2034,8 +2126,8 @@ mod tests {
     #[test]
     fn test_update_cpuid_cache_topology_amd() {
         // Guest topology 2:96:1:2, one die spans 256 ID slots for its
-        // 192 vCPUs. The EPYC 9654 host L3 declares a 16 ID CCX, so the
-        // clamp has nothing to narrow and the host value is kept
+        // 192 vCPUs. The EPYC 9654 host L3 declares a 16 ID CCX, a
+        // multi-package guest widens it to the package
         let mut cpuid = vec![
             host_cache_subleaf(
                 0x8000_001d,
@@ -2073,14 +2165,13 @@ mod tests {
         assert_eq!(sharing_field(&cpuid, 0x8000_001d, 0), 1);
         assert_eq!(sharing_field(&cpuid, 0x8000_001d, 1), 1);
         assert_eq!(sharing_field(&cpuid, 0x8000_001d, 2), 1);
-        // The 16 ID CCX L3 stays intact
-        assert_eq!(sharing_field(&cpuid, 0x8000_001d, 3), 15);
-        // The whole descriptor is untouched, the sharing width is kept
-        // and the core IDs field is reserved on AMD
-        assert_eq!(
-            CpuidPatch::get_cpuid_reg(&cpuid, 0x8000_001d, Some(3), CpuidReg::EAX).unwrap(),
-            host_l3
-        );
+        // L3 is shared across the 192 vCPUs of the package
+        assert_eq!(sharing_field(&cpuid, 0x8000_001d, 3), 191);
+        // Every bit outside the sharing field is untouched and the core
+        // IDs field is reserved on AMD
+        let l3 = CpuidPatch::get_cpuid_reg(&cpuid, 0x8000_001d, Some(3), CpuidReg::EAX).unwrap();
+        let rewritten = CACHE_SHARING_MASK << CACHE_SHARING_SHIFT;
+        assert_eq!(l3 & !rewritten, host_l3 & !rewritten);
         assert_eq!(
             CpuidPatch::get_cpuid_reg(&cpuid, 0x8000_001d, Some(4), CpuidReg::EAX).unwrap(),
             0
@@ -2139,5 +2230,58 @@ mod tests {
         update_cpuid_topology(&mut cpuid, 2, 3000, 1, 1, CpuVendor::Intel, 0);
 
         assert_eq!(sharing_field(&cpuid, 0x4, 3), 0xfff);
+    }
+
+    fn cache_sharing(cpuid: &[CpuIdEntry], leaf: u32, index: u32) -> u32 {
+        let eax = CpuidPatch::get_cpuid_reg(cpuid, leaf, Some(index), CpuidReg::EAX).unwrap();
+        ((eax >> 14) & 0xfff) + 1
+    }
+
+    #[test]
+    fn test_cache_topology_sharing_matches_package() {
+        const LEAF: u32 = 0x8000_001d;
+        // Host-like AMD cache leaf: L1d/L1i per 2 threads, L2 per 2 threads, and
+        // an L3 shared by 16 threads (a whole CCX) -- the host span the guest
+        // must NOT inherit on a vNUMA layout.
+        let mut cpuid = vec![
+            cache_entry(LEAF, 0, 1, 1, 2),  // L1 data
+            cache_entry(LEAF, 1, 2, 1, 2),  // L1 instruction
+            cache_entry(LEAF, 2, 3, 2, 2),  // L2 unified
+            cache_entry(LEAF, 3, 3, 3, 16), // L3 unified
+        ];
+
+        // 1 thread/core, 2 cores/die, 1 die/package, 2 packages => 4 vCPUs with
+        // 2 vCPUs per package (one vNUMA node).
+        update_cpuid_cache_topology(&mut cpuid, 1, 2, 1, CpuVendor::AMD);
+
+        // Per-core caches collapse to the core's thread count (1 here).
+        assert_eq!(cache_sharing(&cpuid, LEAF, 0), 1);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 1), 1);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 2), 1);
+        // The LLC is shared across the whole package (== the vNUMA node).
+        assert_eq!(cache_sharing(&cpuid, LEAF, 3), 2);
+    }
+
+    #[test]
+    fn test_cache_topology_smt_and_intel_leaf() {
+        const LEAF: u32 = 0x4;
+        // Intel deterministic cache leaf with an oversized host L3 span.
+        let mut cpuid = vec![
+            cache_entry(LEAF, 0, 1, 1, 2),  // L1 data
+            cache_entry(LEAF, 1, 2, 1, 2),  // L1 instruction
+            cache_entry(LEAF, 2, 3, 2, 2),  // L2 unified
+            cache_entry(LEAF, 3, 3, 3, 64), // L3 unified
+        ];
+
+        // 2 threads/core, 4 cores/die, 1 die/package, 2 packages => 8 vCPUs with
+        // 4 vCPUs per package.
+        update_cpuid_cache_topology(&mut cpuid, 2, 4, 1, CpuVendor::Intel);
+
+        // Per-core caches share across SMT siblings (2 threads).
+        assert_eq!(cache_sharing(&cpuid, LEAF, 0), 2);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 1), 2);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 2), 2);
+        // The LLC spans the package: 2 threads * 4 cores * 1 die = 8.
+        assert_eq!(cache_sharing(&cpuid, LEAF, 3), 8);
     }
 }
