@@ -695,14 +695,31 @@ pub fn generate_common_cpuid(
     for entry in cpuid.as_mut_slice().iter_mut() {
         #[allow(unused_unsafe)]
         match entry.function {
-            // Clear AMX related bits if the AMX feature is not enabled
-            0x7 if !config.amx => {
-                if entry.index == 0 {
-                    entry.edx &= !((1 << AMX_BF16) | (1 << AMX_TILE) | (1 << AMX_INT8));
+            0x7 => {
+                // Clear AMX related bits if the AMX feature is not enabled
+                if !config.amx {
+                    if entry.index == 0 {
+                        entry.edx &= !((1 << AMX_BF16) | (1 << AMX_TILE) | (1 << AMX_INT8));
+                    }
+                    if entry.index == 1 {
+                        entry.eax &= !(1 << AMX_FP16);
+                        entry.edx &= !(1 << AMX_COMPLEX);
+                    }
                 }
-                if entry.index == 1 {
-                    entry.eax &= !(1 << AMX_FP16);
-                    entry.edx &= !(1 << AMX_COMPLEX);
+                // Enforce the IA32_SPEC_CTRL CPUID dependency the guest kernel
+                // checks: EDX[31] (SSBD via SPEC_CTRL) requires EDX[26]
+                // (SPEC_CTRL). KVM_GET_SUPPORTED_CPUID can advertise SSBD
+                // without SPEC_CTRL on AMD -- where spec-control is exposed via
+                // leaf 0x8000_0008 instead -- which trips a "feature dependency
+                // check failure" warning in the guest. Drop the dependent bit
+                // when its base is absent; real SSBD remains available through
+                // 0x8000_0008.EBX[24].
+                if entry.index == 0 {
+                    const SPEC_CTRL: u32 = 1 << 26;
+                    const SPEC_CTRL_SSBD: u32 = 1 << 31;
+                    if (entry.edx & SPEC_CTRL) == 0 {
+                        entry.edx &= !SPEC_CTRL_SSBD;
+                    }
                 }
             }
             0xd =>
