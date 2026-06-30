@@ -468,6 +468,12 @@ impl VmOps for VmOpsHandler {
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
         if let Err(vm_device::BusError::MissingAddressRange) = self.mmio_bus.read(gpa, data) {
             info!("Guest MMIO read to unregistered address 0x{gpa:x}");
+            // No device claims this range. Return open-bus (all ones), matching
+            // real x86 hardware, so the guest sees the conventional "absent"
+            // value rather than whatever stale bytes were in the buffer. e.g.
+            // Linux's AMD reset-reason probe reads an FCH register that does not
+            // exist in a VM and explicitly ignores an all-ones (U32_MAX) result.
+            data.fill(0xff);
         }
         Ok(())
     }
