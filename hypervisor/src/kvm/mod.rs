@@ -941,6 +941,7 @@ impl vm::Vm for KvmVm {
             vm_fd: self.fd.clone(),
             #[cfg(feature = "sev_snp")]
             memory_slots: self.memory_slots.clone(),
+            diag_trace: std::collections::VecDeque::with_capacity(32),
         };
         Ok(Box::new(vcpu))
     }
@@ -1881,6 +1882,16 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 }
 
 /// Vcpu struct for KVM
+// DIAGNOSTIC: trailing ring buffer of recent MMIO/IO exits, dumped when
+// InternalError fires -- revert before merging.
+#[derive(Clone, Copy)]
+struct DiagBusTrace {
+    at: std::time::Instant,
+    kind: &'static str,
+    addr: u64,
+    len: usize,
+}
+
 pub struct KvmVcpu {
     fd: VcpuFd,
     #[cfg(target_arch = "x86_64")]
@@ -1896,6 +1907,8 @@ pub struct KvmVcpu {
     vm_fd: Arc<VmFd>,
     #[cfg(feature = "sev_snp")]
     memory_slots: Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
+    // DIAGNOSTIC: see DiagBusTrace -- revert before merging.
+    diag_trace: std::collections::VecDeque<DiagBusTrace>,
 }
 
 #[cfg(feature = "sev_snp")]
@@ -1961,6 +1974,33 @@ impl KvmVcpu {
         // SAFETY: FFI call with a valid kvm_device_attr; `addr` is unused here.
         let ret = unsafe { ioctl_with_ref(&self.fd, KVM_HAS_DEVICE_ATTR(), &attr) };
         ret == 0
+    }
+
+    // DIAGNOSTIC: see DiagBusTrace -- revert before merging.
+    fn diag_push(&mut self, kind: &'static str, addr: u64, len: usize) {
+        if self.diag_trace.len() == self.diag_trace.capacity() {
+            self.diag_trace.pop_front();
+        }
+        self.diag_trace.push_back(DiagBusTrace {
+            at: std::time::Instant::now(),
+            kind,
+            addr,
+            len,
+        });
+    }
+
+    fn diag_dump(&self) -> String {
+        let mut out = String::new();
+        for t in &self.diag_trace {
+            out.push_str(&format!(
+                "\n    {:>9.3}ms ago  {kind:<10} addr=0x{addr:x} len={len}",
+                t.at.elapsed().as_secs_f64() * 1000.0,
+                kind = t.kind,
+                addr = t.addr,
+                len = t.len,
+            ));
+        }
+        out
     }
 }
 
@@ -2504,6 +2544,12 @@ impl cpu::Vcpu for KvmVcpu {
             Ok(run) => match run {
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoIn(addr, data) => {
+                    {
+                        if self.diag_trace.len() == self.diag_trace.capacity() {
+                            self.diag_trace.pop_front();
+                        }
+                        self.diag_trace.push_back(DiagBusTrace { at: std::time::Instant::now(), kind: "IoIn", addr: u64::from(addr), len: data.len() });
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .pio_read(addr.into(), data)
@@ -2515,6 +2561,12 @@ impl cpu::Vcpu for KvmVcpu {
                 }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoOut(addr, data) => {
+                    {
+                        if self.diag_trace.len() == self.diag_trace.capacity() {
+                            self.diag_trace.pop_front();
+                        }
+                        self.diag_trace.push_back(DiagBusTrace { at: std::time::Instant::now(), kind: "IoOut", addr: u64::from(addr), len: data.len() });
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .pio_write(addr.into(), data)
@@ -2554,6 +2606,12 @@ impl cpu::Vcpu for KvmVcpu {
                 }
 
                 VcpuExit::MmioRead(addr, data) => {
+                    {
+                        if self.diag_trace.len() == self.diag_trace.capacity() {
+                            self.diag_trace.pop_front();
+                        }
+                        self.diag_trace.push_back(DiagBusTrace { at: std::time::Instant::now(), kind: "MmioRead", addr: addr, len: data.len() });
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .mmio_read(addr, data)
@@ -2564,6 +2622,12 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::Ignore)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    {
+                        if self.diag_trace.len() == self.diag_trace.capacity() {
+                            self.diag_trace.pop_front();
+                        }
+                        self.diag_trace.push_back(DiagBusTrace { at: std::time::Instant::now(), kind: "MmioWrite", addr: addr, len: data.len() });
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .mmio_write(addr, data)
@@ -2656,6 +2720,21 @@ impl cpu::Vcpu for KvmVcpu {
                         })
                         .map(|_| cpu::VmExit::Ignore)
                         .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))
+                }
+
+                VcpuExit::InternalError => {
+                    // kvm-ioctls' VcpuExit::InternalError discards the kernel's
+                    // diagnostic payload; read it back off the raw kvm_run so we
+                    // know *why* KVM gave up instead of just that it did.
+                    let internal = unsafe { self.fd.get_kvm_run().__bindgen_anon_1.internal };
+                    let ndata = (internal.ndata as usize).min(internal.data.len());
+                    Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                        "Unexpected exit reason on vcpu run: InternalError (suberror={}, ndata={}, data={:x?}) trailing bus trace:{}",
+                        internal.suberror,
+                        internal.ndata,
+                        &internal.data[..ndata],
+                        self.diag_dump(),
+                    )))
                 }
 
                 r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
