@@ -201,11 +201,14 @@ impl UringDataIo {
         self.submit_kernel_entry(user_data, &opcode::Nop::new().build().user_data(user_data))
     }
 
-    /// Submits an fsync operation carrying `user_data`.
+    /// Submits an fdatasync operation carrying `user_data`: a guest flush needs the data and the
+    /// metadata to read it back, not the timestamps, and a full fsync of a file whose mtime every
+    /// write touches forces a host journal commit per flush.
     pub fn submit_fsync(&mut self, fd: RawFd, user_data: u64) -> io::Result<()> {
         self.submit_kernel_entry(
             user_data,
             &opcode::Fsync::new(types::Fd(fd))
+                .flags(types::FsyncFlags::DATASYNC)
                 .build()
                 .user_data(user_data),
         )
