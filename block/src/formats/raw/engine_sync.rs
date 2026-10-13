@@ -67,8 +67,9 @@ impl AsyncIo for RawSync {
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
+        // A guest flush needs the data and the metadata to read it back, not the timestamps.
         // SAFETY: FFI call
-        let result = unsafe { libc::fsync(self.raw_file.as_raw_fd() as libc::c_int) };
+        let result = unsafe { libc::fdatasync(self.raw_file.as_raw_fd() as libc::c_int) };
         if result < 0 {
             return Err(AsyncIoError::Fsync(io::Error::last_os_error()));
         }
