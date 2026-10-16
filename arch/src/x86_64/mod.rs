@@ -237,6 +237,58 @@ pub fn get_max_x2apic_id(topology: (u16, u16, u16, u16)) -> u32 {
     )
 }
 
+/// Per-vCPU x2APIC ID for a (possibly unbalanced) vNUMA layout.
+///
+/// [`get_x2apic_id`] derives the package from `cpu_id / (threads*cores*dies)`,
+/// i.e. it can only carve equal-sized packages -- so it cannot place an
+/// unbalanced NUMA layout (e.g. 4+3 vCPUs) such that each guest package maps to
+/// one node. This mirrors Xen's `guest_vcpu_x2apic_id`: each node occupies a
+/// power-of-two-sized window of APIC IDs (sized to the largest node, which the
+/// caller encodes as `cores_per_die`), and a vCPU's ID is
+/// `(node << pkg_shift) | (offset_within_node << thread_width)`. Under-filled
+/// nodes leave the tail of their window unused.
+///
+/// The node index is the proximity domain (guest NUMA id) and the offset is the
+/// vCPU's position in that node's CPU list, so any vCPU->node assignment works.
+/// Falls back to the uniform encoding when there is no usable multi-node layout
+/// (no topology, <=1 node, or an unassigned vCPU); for a balanced layout the
+/// window encoding is bit-identical to the uniform one anyway.
+pub fn vcpu_x2apic_id(
+    cpu_id: u32,
+    topology: Option<(u16, u16, u16, u16)>,
+    numa_nodes: &crate::NumaNodes,
+) -> u32 {
+    let Some((threads, cores, dies, _packages)) = topology else {
+        return get_x2apic_id(cpu_id, topology);
+    };
+    if numa_nodes.len() <= 1 {
+        return get_x2apic_id(cpu_id, topology);
+    }
+
+    // Locate the vCPU's node (proximity domain) and its offset within that
+    // node's CPU list.
+    let mut found: Option<(u32, u32)> = None;
+    for (node_id, node) in numa_nodes.iter() {
+        if let Some(pos) = node.cpus.iter().position(|&c| c == cpu_id) {
+            found = Some((*node_id, pos as u32));
+            break;
+        }
+    }
+    let Some((node_id, offset)) = found else {
+        return get_x2apic_id(cpu_id, topology);
+    };
+
+    // Package window shift, matching the field widths get_x2apic_id /
+    // update_cpuid_topology derive from the same tuple, so the APIC IDs agree
+    // with the CPUID topology leaves the guest reads.
+    let thread_width = u16::BITS - (threads - 1).leading_zeros();
+    let core_width = u16::BITS - (cores - 1).leading_zeros();
+    let die_width = u16::BITS - (dies - 1).leading_zeros();
+    let pkg_shift = thread_width + core_width + die_width;
+
+    (node_id << pkg_shift) | (offset << thread_width)
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum CpuidReg {
     EAX,
@@ -894,14 +946,31 @@ fn required_common_cpuid_updates(
     for entry in cpuid.as_mut_slice().iter_mut() {
         #[allow(unused_unsafe)]
         match entry.function {
-            // Clear AMX related bits if the AMX feature is not enabled
-            0x7 if !config.amx => {
-                if entry.index == 0 {
-                    entry.edx &= !((1 << AMX_BF16) | (1 << AMX_TILE) | (1 << AMX_INT8));
+            0x7 => {
+                // Clear AMX related bits if the AMX feature is not enabled
+                if !config.amx {
+                    if entry.index == 0 {
+                        entry.edx &= !((1 << AMX_BF16) | (1 << AMX_TILE) | (1 << AMX_INT8));
+                    }
+                    if entry.index == 1 {
+                        entry.eax &= !(1 << AMX_FP16);
+                        entry.edx &= !(1 << AMX_COMPLEX);
+                    }
                 }
-                if entry.index == 1 {
-                    entry.eax &= !(1 << AMX_FP16);
-                    entry.edx &= !(1 << AMX_COMPLEX);
+                // Enforce the IA32_SPEC_CTRL CPUID dependency the guest kernel
+                // checks: EDX[31] (SSBD via SPEC_CTRL) requires EDX[26]
+                // (SPEC_CTRL). KVM_GET_SUPPORTED_CPUID can advertise SSBD
+                // without SPEC_CTRL on AMD -- where spec-control is exposed via
+                // leaf 0x8000_0008 instead -- which trips a "feature dependency
+                // check failure" warning in the guest. Drop the dependent bit
+                // when its base is absent; real SSBD remains available through
+                // 0x8000_0008.EBX[24].
+                if entry.index == 0 {
+                    const SPEC_CTRL: u32 = 1 << 26;
+                    const SPEC_CTRL_SSBD: u32 = 1 << 31;
+                    if (entry.edx & SPEC_CTRL) == 0 {
+                        entry.edx &= !SPEC_CTRL_SSBD;
+                    }
                 }
             }
             // Tile Information (purely AMX related).
@@ -1082,8 +1151,11 @@ pub fn configure_vcpu(
     topology: (u16, u16, u16, u16),
     nested: bool,
     setup_registers: bool,
+    // Precomputed x2APIC ID for vNUMA-aware (possibly unbalanced) layouts; when
+    // None the uniform encoding is derived from `topology` as before.
+    x2apic_id_override: Option<u32>,
 ) -> super::Result<()> {
-    let x2apic_id = get_x2apic_id(id, Some(topology));
+    let x2apic_id = x2apic_id_override.unwrap_or_else(|| get_x2apic_id(id, Some(topology)));
 
     // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
     let mut cpuid = cpuid;
@@ -1119,7 +1191,14 @@ pub fn configure_vcpu(
     assert!(apic_id_patched);
 
     update_cpuid_topology(
-        &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
+        &mut cpuid,
+        topology.0,
+        topology.1,
+        topology.2,
+        topology.3,
+        cpu_vendor,
+        id,
+        x2apic_id_override,
     );
 
     // The TSC frequency CPUID leaf should not be included when running with HyperV emulation
@@ -1593,6 +1672,7 @@ fn max_addressable_ids(width: u32, mask: u32) -> u32 {
     ((1u64 << width) - 1).min(mask as u64) as u32
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_cpuid_topology(
     cpuid: &mut Vec<CpuIdEntry>,
     threads_per_core: u16,
@@ -1601,11 +1681,14 @@ fn update_cpuid_topology(
     packages: u16,
     cpu_vendor: CpuVendor,
     id: u32,
+    x2apic_id_override: Option<u32>,
 ) {
-    let x2apic_id = get_x2apic_id(
-        id,
-        Some((threads_per_core, cores_per_die, dies_per_package, packages)),
-    );
+    let x2apic_id = x2apic_id_override.unwrap_or_else(|| {
+        get_x2apic_id(
+            id,
+            Some((threads_per_core, cores_per_die, dies_per_package, packages)),
+        )
+    });
 
     // Note: the topology defined here is per "package" (~NUMA node).
     let thread_width = u16::BITS - (threads_per_core - 1).leading_zeros();
@@ -1765,7 +1848,88 @@ fn update_cpuid_topology(
             CpuidPatch::set_cpuid_reg(cpuid, 0x8000_0008, Some(0), CpuidReg::ECX, 0u32);
         }
     }
+
+    // Our vNUMA layout maps one guest package per NUMA node. The cache leaves
+    // are inherited verbatim from the host (KVM_GET_SUPPORTED_CPUID) and still
+    // describe the host's last-level cache span (e.g. a whole CCX), so on a
+    // multi-package layout the guest sees an LLC that crosses node boundaries
+    // and the kernel warns:
+    //   "sched: CPU #N's llc-sibling CPU #M is not on the same node!".
+    // Re-derive the cache-sharing topology from the synthesized layout so the
+    // LLC stays contained within a package (== a vNUMA node). Single-package
+    // guests keep the host's cache topology, which is already consistent.
+    if packages > 1 {
+        update_cpuid_cache_topology(
+            cpuid,
+            threads_per_core,
+            cores_per_die,
+            dies_per_package,
+            cpu_vendor,
+        );
+    }
 }
+
+/// Re-derive the deterministic cache topology leaf so each cache level's
+/// "logical processors sharing this cache" field reflects the synthesized CPU
+/// topology rather than the host's.
+///
+/// The leaf has an identical layout on Intel (`0x4`) and AMD (`0x8000_001d`):
+///   EAX[4:0]   cache type (0 = no further caches at this subleaf)
+///   EAX[7:5]   cache level (1, 2, 3, ...)
+///   EAX[25:14] max number of logical processors sharing this cache, minus 1
+///
+/// Per-core caches (levels 1-2) are shared across a core's threads; the
+/// last-level cache (level 3+) is shared across a whole package, which is how
+/// we expose a single vNUMA node. Cache geometry (size/associativity carried in
+/// the other registers) is left untouched.
+fn update_cpuid_cache_topology(
+    cpuid: &mut Vec<CpuIdEntry>,
+    threads_per_core: u16,
+    cores_per_die: u16,
+    dies_per_package: u16,
+    cpu_vendor: CpuVendor,
+) {
+    let leaf: u32 = match cpu_vendor {
+        CpuVendor::AMD => 0x8000_001d,
+        // Intel and unknown vendors use the Intel deterministic cache leaf.
+        _ => 0x4,
+    };
+
+    let threads_per_core = threads_per_core as u32;
+    let threads_per_package = threads_per_core * cores_per_die as u32 * dies_per_package as u32;
+
+    // Snapshot the subleaf indices up front so we can mutate entries in place
+    // without assuming the host enumerated them contiguously from zero.
+    let indices: Vec<u32> = cpuid
+        .iter()
+        .filter(|entry| entry.function == leaf)
+        .map(|entry| entry.index)
+        .collect();
+
+    for index in indices {
+        let Some(eax) = CpuidPatch::get_cpuid_reg(cpuid, leaf, Some(index), CpuidReg::EAX) else {
+            continue;
+        };
+
+        let cache_type = eax & 0x1f;
+        if cache_type == 0 {
+            // Null subleaf: no cache described here.
+            continue;
+        }
+        let cache_level = (eax >> 5) & 0x7;
+
+        let sharing = if cache_level <= 2 {
+            threads_per_core
+        } else {
+            threads_per_package
+        };
+
+        // Replace EAX[25:14] with (sharing - 1), preserving every other field.
+        let eax = (eax & !(0xfff << 14)) | (((sharing - 1) & 0xfff) << 14);
+        CpuidPatch::set_cpuid_reg(cpuid, leaf, Some(index), CpuidReg::EAX, eax);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use linux_loader::loader::bootparam::boot_e820_entry;
@@ -1985,6 +2149,16 @@ mod tests {
         }
     }
 
+    fn cache_entry(leaf: u32, index: u32, cache_type: u32, level: u32, sharing: u32) -> CpuIdEntry {
+        CpuIdEntry {
+            function: leaf,
+            index,
+            flags: CPUID_FLAG_VALID_INDEX,
+            eax: cache_type | (level << 5) | ((sharing - 1) << 14),
+            ..Default::default()
+        }
+    }
+
     fn sharing_field(cpuid: &[CpuIdEntry], function: u32, index: u32) -> u32 {
         let eax = CpuidPatch::get_cpuid_reg(cpuid, function, Some(index), CpuidReg::EAX).unwrap();
         (eax >> CACHE_SHARING_SHIFT) & CACHE_SHARING_MASK
@@ -1994,7 +2168,8 @@ mod tests {
     fn test_update_cpuid_cache_topology_intel() {
         // Guest topology 2:60:1:2, one die spans 128 ID slots for its
         // 120 vCPUs. The host leaf 0x4 declares a socket wide L3 of 256
-        // addressable IDs, wider than the die, so only the L3 is clamped
+        // addressable IDs, a multi-package guest derives every sharing
+        // width from its own topology
         let mut cpuid = vec![
             host_cache_subleaf(0x4, 0, 1, 1, (1 << CACHE_SHARING_SHIFT) | CACHE_SELF_INIT),
             host_cache_subleaf(0x4, 1, 1, 2, (1 << CACHE_SHARING_SHIFT) | CACHE_SELF_INIT),
@@ -2009,14 +2184,14 @@ mod tests {
             host_cache_subleaf(0x4, 4, 0, 0, 0),
         ];
         let host_l3 = cpuid[3].eax;
-        update_cpuid_topology(&mut cpuid, 2, 60, 1, 2, CpuVendor::Intel, 0);
+        update_cpuid_topology(&mut cpuid, 2, 60, 1, 2, CpuVendor::Intel, 0, None);
 
-        // L1 and L2 fit inside the die, the host values are kept
+        // L1 and L2 are shared across the 2 threads of a core
         assert_eq!(sharing_field(&cpuid, 0x4, 0), 1);
         assert_eq!(sharing_field(&cpuid, 0x4, 1), 1);
-        assert_eq!(sharing_field(&cpuid, 0x4, 2), 3);
-        // L3 is clamped to one die, 1 << 7 addressable IDs
-        assert_eq!(sharing_field(&cpuid, 0x4, 3), 127);
+        assert_eq!(sharing_field(&cpuid, 0x4, 2), 1);
+        // L3 is shared across the 120 vCPUs of the package
+        assert_eq!(sharing_field(&cpuid, 0x4, 3), 119);
         let l3 = CpuidPatch::get_cpuid_reg(&cpuid, 0x4, Some(3), CpuidReg::EAX).unwrap();
         // The core IDs field holds 64 core ID slots for the 60 cores
         assert_eq!((l3 >> CACHE_CORE_IDS_SHIFT) & CACHE_CORE_IDS_MASK, 63);
@@ -2034,8 +2209,8 @@ mod tests {
     #[test]
     fn test_update_cpuid_cache_topology_amd() {
         // Guest topology 2:96:1:2, one die spans 256 ID slots for its
-        // 192 vCPUs. The EPYC 9654 host L3 declares a 16 ID CCX, so the
-        // clamp has nothing to narrow and the host value is kept
+        // 192 vCPUs. The EPYC 9654 host L3 declares a 16 ID CCX, a
+        // multi-package guest widens it to the package
         let mut cpuid = vec![
             host_cache_subleaf(
                 0x8000_001d,
@@ -2068,19 +2243,18 @@ mod tests {
             host_cache_subleaf(0x8000_001d, 4, 0, 0, 0),
         ];
         let host_l3 = cpuid[3].eax;
-        update_cpuid_topology(&mut cpuid, 2, 96, 1, 2, CpuVendor::AMD, 0);
+        update_cpuid_topology(&mut cpuid, 2, 96, 1, 2, CpuVendor::AMD, 0, None);
 
         assert_eq!(sharing_field(&cpuid, 0x8000_001d, 0), 1);
         assert_eq!(sharing_field(&cpuid, 0x8000_001d, 1), 1);
         assert_eq!(sharing_field(&cpuid, 0x8000_001d, 2), 1);
-        // The 16 ID CCX L3 stays intact
-        assert_eq!(sharing_field(&cpuid, 0x8000_001d, 3), 15);
-        // The whole descriptor is untouched, the sharing width is kept
-        // and the core IDs field is reserved on AMD
-        assert_eq!(
-            CpuidPatch::get_cpuid_reg(&cpuid, 0x8000_001d, Some(3), CpuidReg::EAX).unwrap(),
-            host_l3
-        );
+        // L3 is shared across the 192 vCPUs of the package
+        assert_eq!(sharing_field(&cpuid, 0x8000_001d, 3), 191);
+        // Every bit outside the sharing field is untouched and the core
+        // IDs field is reserved on AMD
+        let l3 = CpuidPatch::get_cpuid_reg(&cpuid, 0x8000_001d, Some(3), CpuidReg::EAX).unwrap();
+        let rewritten = CACHE_SHARING_MASK << CACHE_SHARING_SHIFT;
+        assert_eq!(l3 & !rewritten, host_l3 & !rewritten);
         assert_eq!(
             CpuidPatch::get_cpuid_reg(&cpuid, 0x8000_001d, Some(4), CpuidReg::EAX).unwrap(),
             0
@@ -2115,7 +2289,7 @@ mod tests {
                 (63 << CACHE_SHARING_SHIFT) | CACHE_SELF_INIT,
             ),
         ];
-        update_cpuid_topology(&mut cpuid, 2, 8, 12, 1, CpuVendor::AMD, 0);
+        update_cpuid_topology(&mut cpuid, 2, 8, 12, 1, CpuVendor::AMD, 0, None);
 
         // L1 and L2 stay per core even with multiple dies
         assert_eq!(sharing_field(&cpuid, 0x8000_001d, 0), 1);
@@ -2136,8 +2310,125 @@ mod tests {
             3,
             (0xfff << CACHE_SHARING_SHIFT) | CACHE_SELF_INIT,
         )];
-        update_cpuid_topology(&mut cpuid, 2, 3000, 1, 1, CpuVendor::Intel, 0);
+        update_cpuid_topology(&mut cpuid, 2, 3000, 1, 1, CpuVendor::Intel, 0, None);
 
         assert_eq!(sharing_field(&cpuid, 0x4, 3), 0xfff);
+    }
+
+    fn cache_sharing(cpuid: &[CpuIdEntry], leaf: u32, index: u32) -> u32 {
+        let eax = CpuidPatch::get_cpuid_reg(cpuid, leaf, Some(index), CpuidReg::EAX).unwrap();
+        ((eax >> 14) & 0xfff) + 1
+    }
+
+    #[test]
+    fn test_cache_topology_sharing_matches_package() {
+        const LEAF: u32 = 0x8000_001d;
+        // Host-like AMD cache leaf: L1d/L1i per 2 threads, L2 per 2 threads, and
+        // an L3 shared by 16 threads (a whole CCX) -- the host span the guest
+        // must NOT inherit on a vNUMA layout.
+        let mut cpuid = vec![
+            cache_entry(LEAF, 0, 1, 1, 2),  // L1 data
+            cache_entry(LEAF, 1, 2, 1, 2),  // L1 instruction
+            cache_entry(LEAF, 2, 3, 2, 2),  // L2 unified
+            cache_entry(LEAF, 3, 3, 3, 16), // L3 unified
+        ];
+
+        // 1 thread/core, 2 cores/die, 1 die/package, 2 packages => 4 vCPUs with
+        // 2 vCPUs per package (one vNUMA node).
+        update_cpuid_cache_topology(&mut cpuid, 1, 2, 1, CpuVendor::AMD);
+
+        // Per-core caches collapse to the core's thread count (1 here).
+        assert_eq!(cache_sharing(&cpuid, LEAF, 0), 1);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 1), 1);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 2), 1);
+        // The LLC is shared across the whole package (== the vNUMA node).
+        assert_eq!(cache_sharing(&cpuid, LEAF, 3), 2);
+    }
+
+    #[test]
+    fn test_cache_topology_smt_and_intel_leaf() {
+        const LEAF: u32 = 0x4;
+        // Intel deterministic cache leaf with an oversized host L3 span.
+        let mut cpuid = vec![
+            cache_entry(LEAF, 0, 1, 1, 2),  // L1 data
+            cache_entry(LEAF, 1, 2, 1, 2),  // L1 instruction
+            cache_entry(LEAF, 2, 3, 2, 2),  // L2 unified
+            cache_entry(LEAF, 3, 3, 3, 64), // L3 unified
+        ];
+
+        // 2 threads/core, 4 cores/die, 1 die/package, 2 packages => 8 vCPUs with
+        // 4 vCPUs per package.
+        update_cpuid_cache_topology(&mut cpuid, 2, 4, 1, CpuVendor::Intel);
+
+        // Per-core caches share across SMT siblings (2 threads).
+        assert_eq!(cache_sharing(&cpuid, LEAF, 0), 2);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 1), 2);
+        assert_eq!(cache_sharing(&cpuid, LEAF, 2), 2);
+        // The LLC spans the package: 2 threads * 4 cores * 1 die = 8.
+        assert_eq!(cache_sharing(&cpuid, LEAF, 3), 8);
+    }
+
+    fn numa_nodes(groups: &[&[u32]]) -> crate::NumaNodes {
+        let mut nodes = crate::NumaNodes::new();
+        for (i, cpus) in groups.iter().enumerate() {
+            nodes.insert(
+                i as u32,
+                crate::NumaNode {
+                    cpus: cpus.to_vec(),
+                    ..Default::default()
+                },
+            );
+        }
+        nodes
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_balanced_matches_uniform() {
+        // For a balanced layout the window encoding is bit-identical to the
+        // uniform one, so existing (balanced) guests are unaffected.
+        let topo = (1u16, 2u16, 1u16, 2u16);
+        let nodes = numa_nodes(&[&[0, 1], &[2, 3]]);
+        for cpu in 0..4 {
+            assert_eq!(
+                vcpu_x2apic_id(cpu, Some(topo), &nodes),
+                get_x2apic_id(cpu, Some(topo)),
+            );
+        }
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_unbalanced_two_nodes() {
+        // 3 + 4 vCPUs: cores_per_die = largest node = 4 -> pkg_shift 2. Node 0
+        // (the short one) leaves APIC ID 3 unused.
+        let topo = (1u16, 4u16, 1u16, 2u16);
+        let nodes = numa_nodes(&[&[0, 1, 2], &[3, 4, 5, 6]]);
+        let ids: Vec<u32> = (0..7)
+            .map(|c| vcpu_x2apic_id(c, Some(topo), &nodes))
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_unbalanced_three_nodes() {
+        // 3 + 2 + 2 vCPUs: cores_per_die = 3 -> pkg_shift 2. Each node's window
+        // is 4 APIC IDs wide; the two short nodes leave their tails unused.
+        let topo = (1u16, 3u16, 1u16, 3u16);
+        let nodes = numa_nodes(&[&[0, 1, 2], &[3, 4], &[5, 6]]);
+        let ids: Vec<u32> = (0..7)
+            .map(|c| vcpu_x2apic_id(c, Some(topo), &nodes))
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 4, 5, 8, 9]);
+    }
+
+    #[test]
+    fn vcpu_x2apic_id_single_node_falls_back() {
+        let topo = (1u16, 4u16, 1u16, 1u16);
+        let nodes = numa_nodes(&[&[0, 1, 2, 3]]);
+        for cpu in 0..4 {
+            assert_eq!(
+                vcpu_x2apic_id(cpu, Some(topo), &nodes),
+                get_x2apic_id(cpu, Some(topo)),
+            );
+        }
     }
 }

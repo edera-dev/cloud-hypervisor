@@ -71,6 +71,7 @@ type ConsoleDeviceResult<T> = result::Result<T, ConsoleDeviceError>;
 #[derive(Clone)]
 pub enum ConsoleTransport {
     File(Arc<File>),
+    FilePair(Arc<File>, Arc<File>),
     Pty(Arc<File>),
     Tty(Arc<File>),
     Null,
@@ -200,15 +201,23 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
     let console_info = ConsoleInfo {
         console: match vmconfig.console.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.console.common.file.as_ref().unwrap())
-                    .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                ConsoleTransport::File(Arc::new(file))
+                let output_file =
+                    File::create(vmconfig.console.common.output_file.as_ref().unwrap())
+                        .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
+                match vmconfig.console.common.input_file.as_ref() {
+                    Some(input_file_path) => {
+                        let input_file = File::open(input_file_path)
+                            .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
+                        ConsoleTransport::FilePair(Arc::new(output_file), Arc::new(input_file))
+                    }
+                    None => ConsoleTransport::File(Arc::new(output_file)),
+                }
             }
             ConsoleOutputMode::Pty => {
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 set_raw_mode(&sub_fd.as_raw_fd(), &mut original_termios_opt)?;
-                vmconfig.console.common.file = Some(path.clone());
+                vmconfig.console.common.output_file = Some(path.clone());
                 vmm.console_resize_pipe = Some(Arc::new(
                     listen_for_sigwinch_on_tty(sub_fd, &vmm.seccomp_action)
                         .map_err(ConsoleDeviceError::StartSigwinchListener)?,
@@ -264,15 +273,23 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
         },
         serial: match vmconfig.serial.common.mode {
             ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.serial.common.file.as_ref().unwrap())
-                    .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                ConsoleTransport::File(Arc::new(file))
+                let output_file =
+                    File::create(vmconfig.serial.common.output_file.as_ref().unwrap())
+                        .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
+                match vmconfig.serial.common.input_file.as_ref() {
+                    Some(input_file_path) => {
+                        let input_file = File::open(input_file_path)
+                            .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
+                        ConsoleTransport::FilePair(Arc::new(output_file), Arc::new(input_file))
+                    }
+                    None => ConsoleTransport::File(Arc::new(output_file)),
+                }
             }
             ConsoleOutputMode::Pty => {
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
                 set_raw_mode(&sub_fd.as_raw_fd(), &mut original_termios_opt)?;
-                vmconfig.serial.common.file = Some(path.clone());
+                vmconfig.serial.common.output_file = Some(path.clone());
                 ConsoleTransport::Pty(Arc::new(main_fd))
             }
             ConsoleOutputMode::Tty => {

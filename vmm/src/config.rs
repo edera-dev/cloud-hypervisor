@@ -201,6 +201,8 @@ pub enum ValidationError {
     /// Missing file value for console
     #[error("Path missing when using file console mode")]
     ConsoleFileMissing,
+    #[error("Console input is not supported by this endpoint")]
+    ConsoleInputUnsupported,
     /// Missing socket path for console
     #[error("Path missing when using socket console mode")]
     ConsoleSocketPathMissing,
@@ -2449,7 +2451,7 @@ impl PmemConfig {
 
 impl CommonConsoleConfig {
     const VALUELESS_OPTIONS: &[&str] = &["off", "pty", "tty", "null"];
-    const VALUE_OPTIONS: &[&str] = &["file", "socket"];
+    const VALUE_OPTIONS: &[&str] = &["file", "socket", "input_file"];
 
     fn parse(console: &str, map_err: impl Fn(OptionParserError) -> Error) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2458,7 +2460,8 @@ impl CommonConsoleConfig {
             .add_all(Self::VALUE_OPTIONS);
         parser.parse_subset(console).map_err(map_err)?;
 
-        let mut file: Option<PathBuf> = None;
+        let mut output_file: Option<PathBuf> = None;
+        let mut input_file: Option<PathBuf> = None;
         let mut socket: Option<PathBuf> = None;
         let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
 
@@ -2471,10 +2474,11 @@ impl CommonConsoleConfig {
             mode = ConsoleOutputMode::Null;
         } else if parser.is_set("file") {
             mode = ConsoleOutputMode::File;
-            file =
+            output_file =
                 Some(PathBuf::from(parser.get("file").ok_or(
                     Error::Validation(ValidationError::ConsoleFileMissing),
                 )?));
+            input_file = parser.get("input_file").map(PathBuf::from);
         } else if parser.is_set("socket") {
             mode = ConsoleOutputMode::Socket;
             socket = Some(PathBuf::from(parser.get("socket").ok_or(
@@ -2484,7 +2488,12 @@ impl CommonConsoleConfig {
             return Err(Error::ParseConsoleInvalidModeGiven);
         }
 
-        Ok(Self { mode, file, socket })
+        Ok(Self {
+            mode,
+            output_file,
+            input_file,
+            socket,
+        })
     }
 
     pub fn validate(&self) -> ValidationResult<()> {
@@ -3531,13 +3540,24 @@ impl VmConfig {
             warn!("Using TTY output for multiple consoles: {tty_consoles:?}");
         }
 
-        if self.console.common.mode == ConsoleOutputMode::File && self.console.common.file.is_none()
+        if self.console.common.mode == ConsoleOutputMode::File
+            && self.console.common.output_file.is_none()
         {
             return Err(ValidationError::ConsoleFileMissing);
+        } else if self.console.common.mode != ConsoleOutputMode::File
+            && self.console.common.input_file.is_some()
+        {
+            return Err(ValidationError::ConsoleInputUnsupported);
         }
 
-        if self.serial.common.mode == ConsoleOutputMode::File && self.serial.common.file.is_none() {
+        if self.serial.common.mode == ConsoleOutputMode::File
+            && self.serial.common.output_file.is_none()
+        {
             return Err(ValidationError::ConsoleFileMissing);
+        } else if self.serial.common.mode != ConsoleOutputMode::File
+            && self.serial.common.input_file.is_some()
+        {
+            return Err(ValidationError::ConsoleInputUnsupported);
         }
 
         if self.cpus.max_vcpus < self.cpus.boot_vcpus {
@@ -3694,11 +3714,16 @@ impl VmConfig {
                 return Err(ValidationError::CpuTopologyDiesPerPackage);
             }
 
+            // The topology must describe at least as many slots as there are
+            // vCPUs. It may describe more: a vNUMA layout sizes cores_per_die to
+            // the largest node and gives every node a package window of that
+            // size, so unbalanced nodes leave the tail of their window empty
+            // (their APIC IDs are placed accordingly -- see vcpu_x2apic_id).
             let total: u32 = (t.threads_per_core as u32)
                 * (t.cores_per_die as u32)
                 * (t.dies_per_package as u32)
                 * (t.packages as u32);
-            if total != self.cpus.max_vcpus {
+            if total < self.cpus.max_vcpus {
                 return Err(ValidationError::CpuTopologyCount);
             }
         }
@@ -5146,8 +5171,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_console_parsing() -> Result<()> {
-        let console_config = |mode, file, socket, iommu| ConsoleConfig {
-            common: CommonConsoleConfig { file, mode, socket },
+        let console_config = |mode, output_file, input_file, socket, iommu| ConsoleConfig {
+            common: CommonConsoleConfig {
+                output_file,
+                input_file,
+                mode,
+                socket,
+            },
             pci_common: PciDeviceCommonConfig {
                 iommu,
                 ..Default::default()
@@ -5158,19 +5188,19 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         ConsoleConfig::parse("badmode").unwrap_err();
         assert_eq!(
             ConsoleConfig::parse("off")?,
-            console_config(ConsoleOutputMode::Off, None, None, IommuType::Off)
+            console_config(ConsoleOutputMode::Off, None, None, None, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("pty")?,
-            console_config(ConsoleOutputMode::Pty, None, None, IommuType::Off)
+            console_config(ConsoleOutputMode::Pty, None, None, None, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("tty")?,
-            console_config(ConsoleOutputMode::Tty, None, None, IommuType::Off)
+            console_config(ConsoleOutputMode::Tty, None, None, None, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("null")?,
-            console_config(ConsoleOutputMode::Null, None, None, IommuType::Off)
+            console_config(ConsoleOutputMode::Null, None, None, None, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console")?,
@@ -5178,18 +5208,30 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ConsoleOutputMode::File,
                 Some(PathBuf::from("/tmp/console")),
                 None,
+                None,
+                IommuType::Off
+            )
+        );
+        assert_eq!(
+            ConsoleConfig::parse("file=/tmp/console_out,input_file=/tmp/console_in")?,
+            console_config(
+                ConsoleOutputMode::File,
+                Some(PathBuf::from("/tmp/console_out")),
+                Some(PathBuf::from("/tmp/console_in")),
+                None,
                 IommuType::Off
             )
         );
         assert_eq!(
             ConsoleConfig::parse("null,iommu=on")?,
-            console_config(ConsoleOutputMode::Null, None, None, IommuType::Virtio)
+            console_config(ConsoleOutputMode::Null, None, None, None, IommuType::Virtio)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console,iommu=on")?,
             console_config(
                 ConsoleOutputMode::File,
                 Some(PathBuf::from("/tmp/console")),
+                None,
                 None,
                 IommuType::Virtio
             )
@@ -5198,6 +5240,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ConsoleConfig::parse("socket=/tmp/serial.sock,iommu=on")?,
             console_config(
                 ConsoleOutputMode::Socket,
+                None,
                 None,
                 Some(PathBuf::from("/tmp/serial.sock")),
                 IommuType::Virtio
@@ -6140,14 +6183,16 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pmem: None,
             serial: SerialConfig {
                 common: CommonConsoleConfig {
-                    file: None,
+                    output_file: None,
+                    input_file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
                 },
             },
             console: ConsoleConfig {
                 common: CommonConsoleConfig {
-                    file: None,
+                    output_file: None,
+                    input_file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
                 },
@@ -6266,10 +6311,17 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.serial.common.mode = ConsoleOutputMode::File;
-        invalid_config.serial.common.file = None;
+        invalid_config.serial.common.output_file = None;
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::ConsoleFileMissing)
+        );
+
+        invalid_config.serial.common.mode = ConsoleOutputMode::Pty;
+        invalid_config.serial.common.input_file = Some(PathBuf::from("/dev/null"));
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ConsoleInputUnsupported)
         );
 
         let mut invalid_config = valid_config.clone();
@@ -6296,12 +6348,15 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::CpusMaxLowerThanBoot(16, 32))
         );
 
+        // A topology describing fewer slots than max_vcpus is rejected. (More
+        // slots than vCPUs is allowed: a vNUMA layout over-provisions package
+        // windows for unbalanced nodes.)
         let mut invalid_config = valid_config.clone();
         invalid_config.cpus.max_vcpus = 16;
         invalid_config.cpus.boot_vcpus = 16;
         invalid_config.cpus.topology = Some(CpuTopology {
-            threads_per_core: 2,
-            cores_per_die: 8,
+            threads_per_core: 1,
+            cores_per_die: 4,
             dies_per_package: 1,
             packages: 2,
         });
@@ -6309,6 +6364,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::CpuTopologyCount)
         );
+
+        // Over-provisioned topology (more slots than vCPUs) is now valid.
+        let mut over_provisioned = valid_config.clone();
+        over_provisioned.cpus.max_vcpus = 16;
+        over_provisioned.cpus.boot_vcpus = 16;
+        over_provisioned.cpus.topology = Some(CpuTopology {
+            threads_per_core: 2,
+            cores_per_die: 8,
+            dies_per_package: 1,
+            packages: 2,
+        });
+        over_provisioned.validate().unwrap();
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.cpus.max_vcpus = 8;

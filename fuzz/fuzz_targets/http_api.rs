@@ -180,14 +180,16 @@ impl RequestHandler for StubApiRequestHandler {
                 pmem: None,
                 serial: SerialConfig {
                     common: CommonConsoleConfig {
-                        file: None,
+                        output_file: None,
+                        input_file: None,
                         mode: ConsoleOutputMode::Tty,
                         socket: None,
                     },
                 },
                 console: ConsoleConfig {
                     common: CommonConsoleConfig {
-                        file: None,
+                        output_file: None,
+                        input_file: None,
                         mode: ConsoleOutputMode::Tty,
                         socket: None,
                     },

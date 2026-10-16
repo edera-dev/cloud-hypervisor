@@ -90,7 +90,8 @@ impl AioDataIo {
         Ok(())
     }
 
-    /// Submits an fsync operation carrying `user_data`.
+    /// Submits an fdatasync operation carrying `user_data`: a guest flush needs the data and the
+    /// metadata to read it back, not the timestamps.
     pub fn submit_fsync(&mut self, fd: RawFd, user_data: u64) -> io::Result<()> {
         if self.in_flight.contains_key(&user_data) {
             return Err(duplicate_user_data_error(user_data));
@@ -98,7 +99,7 @@ impl AioDataIo {
 
         let mut iocb = aio::IoControlBlock {
             aio_fildes: fd.as_raw_fd() as u32,
-            aio_lio_opcode: aio::IOCB_CMD_FSYNC as u16,
+            aio_lio_opcode: aio::IOCB_CMD_FDSYNC as u16,
             aio_data: user_data,
             aio_flags: aio::IOCB_FLAG_RESFD,
             aio_resfd: self.completions.notifier().as_raw_fd() as u32,
