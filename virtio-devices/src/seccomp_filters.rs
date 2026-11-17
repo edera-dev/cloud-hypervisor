@@ -170,6 +170,8 @@ fn virtio_mem_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_ioctl, create_virtio_mem_ioctl_seccomp_rule()),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_sendmsg, vec![]),
+        // vfio-user DMA unmap on unplug writes to the client socket, which is send(2).
+        (libc::SYS_sendto, vec![]),
     ]
 }
 
